@@ -75,6 +75,70 @@ swift build
 swift run ampbridge
 ```
 
+## How AmpBridge uses your existing subscription
+
+AmpBridge currently does **not** implement its own OpenAI/Claude browser OAuth flow.
+Instead, it reuses the local provider backend you already have on this machine.
+
+Current chain:
+
+```text
+AMP CLI
+  -> http://localhost:8327   (AmpBridge)
+  -> http://127.0.0.1:8318   (existing local provider backend)
+  -> your existing OAuth/subscription tokens
+```
+
+What each layer does:
+
+- **AmpBridge (8327)**
+  - Accepts AMP requests
+  - Routes AMP auth/internal requests to `ampcode.com`
+  - Routes Anthropic provider requests to AMP official backend
+  - Routes OpenAI Responses requests to the local provider backend
+  - Rewrites/repairs OpenAI Responses SSE output for AMP compatibility
+
+- **Local provider backend (8318)**
+  - Uses the existing token files already stored on your machine
+  - Actually consumes your OpenAI/Codex/Claude subscription-backed OAuth
+  - In the current setup, this is the same backend used by VibeProxy/CLIProxyAPI
+
+- **Local token store**
+  - Existing tokens are typically stored under:
+    - `~/.cli-proxy-api/*.json`
+
+So today, AmpBridge reuses your existing subscription by forwarding provider traffic to `8318`.
+It does **not** yet replace the token-login system.
+
+### Testing AmpBridge directly
+
+To test AmpBridge without disturbing the current VibeProxy setup on `8317`, point AMP to `8327` explicitly:
+
+```bash
+AMP_URL=http://localhost:8327 amp --mode deep
+```
+
+For a one-shot command:
+
+```bash
+AMP_URL=http://localhost:8327 amp --mode deep --dangerously-allow-all -x "Reply with exactly: TEST"
+```
+
+### Current default ports
+
+- `8327` — AmpBridge
+- `8318` — existing local provider backend (token/OAuth consumer)
+- `8317` — current VibeProxy app (if running)
+
+### Important current limitation
+
+AmpBridge currently depends on the existing provider backend on port `8318`.
+That means:
+- if `8318` is not running, provider requests will fail
+- if the token files under `~/.cli-proxy-api/` are missing or expired, provider requests will fail
+
+A future phase may let AmpBridge read token files directly or replace the local provider backend entirely, but that is **not** implemented yet.
+
 ## Architecture sketch
 
 - `AmpBridgeConfig.swift` — ports, upstream URLs, enabled routes (default listen port: `8327`)
