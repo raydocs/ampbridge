@@ -77,7 +77,7 @@ swift run ampbridge
 
 ## Architecture sketch
 
-- `AmpBridgeConfig.swift` — ports, upstream URLs, enabled routes
+- `AmpBridgeConfig.swift` — ports, upstream URLs, enabled routes (default listen port: `8327`)
 - `RouteClassifier.swift` — classify incoming AMP paths
 - `OpenAIResponsesStreamRewriter.swift` — SSE state machine and final output reconstruction
 - `AmpBridgeServer.swift` — bridge server skeleton
