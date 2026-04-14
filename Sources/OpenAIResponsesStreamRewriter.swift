@@ -20,7 +20,57 @@ final class OpenAIResponsesStreamRewriter {
             pending.removeAll(keepingCapacity: false)
         }
 
+        if isComplete, let currentResponseID, let state = stateByResponseID[currentResponseID], !state.terminalSeen,
+           let synthesized = synthesizeTerminalEvent(for: state) {
+            output.append(synthesized)
+        }
+
         return output
+    }
+
+    private func synthesizeTerminalEvent(for state: ResponseState) -> Data? {
+        let sequenceNumber = state.lastSequenceNumber + 1
+        if state.hasRenderableOutput {
+            let response = state.buildCompletedResponse(from: [
+                "id": state.responseID,
+                "object": "response",
+                "model": state.model as Any,
+                "status": "completed",
+                "output": [],
+                "usage": state.usage as Any,
+                "error": NSNull(),
+                "incomplete_details": NSNull()
+            ])
+            let event: [String: Any] = [
+                "type": "response.completed",
+                "sequence_number": sequenceNumber,
+                "response": response
+            ]
+            return encodeSSE(eventName: "response.completed", json: event)
+        }
+
+        let response: [String: Any] = [
+            "id": state.responseID,
+            "object": "response",
+            "model": state.model as Any,
+            "status": "incomplete",
+            "output": [],
+            "usage": state.usage as Any,
+            "error": NSNull(),
+            "incomplete_details": ["reason": "stream_ended_unexpectedly"]
+        ]
+        let event: [String: Any] = [
+            "type": "response.incomplete",
+            "sequence_number": sequenceNumber,
+            "response": response
+        ]
+        return encodeSSE(eventName: "response.incomplete", json: event)
+    }
+
+    private func encodeSSE(eventName: String, json: [String: Any]) -> Data? {
+        guard let data = try? JSONSerialization.data(withJSONObject: json),
+              let text = String(data: data, encoding: .utf8) else { return nil }
+        return Data("event: \(eventName)\ndata: \(text)\n\n".utf8)
     }
 
     private func nextEventRange(in data: Data) -> Range<Int>? {
@@ -106,6 +156,7 @@ final class OpenAIResponsesStreamRewriter {
             state.model = response["model"] as? String
             state.status = response["status"] as? String
             state.usage = response["usage"]
+            state.lastSequenceNumber = max(state.lastSequenceNumber, json["sequence_number"] as? Int ?? 0)
             stateByResponseID[responseID] = state
 
         case "response.output_item.added":
@@ -168,9 +219,14 @@ final class OpenAIResponsesStreamRewriter {
             state.error = response["error"]
             state.incompleteDetails = response["incomplete_details"]
             state.backfillNamesFromCompletedResponse(response)
+            state.terminalSeen = true
+            state.lastSequenceNumber = max(state.lastSequenceNumber, json["sequence_number"] as? Int ?? 0)
             stateByResponseID[responseID] = state
 
         default:
+            if let currentResponseID, let state = stateByResponseID[currentResponseID] {
+                state.lastSequenceNumber = max(state.lastSequenceNumber, json["sequence_number"] as? Int ?? 0)
+            }
             break
         }
     }
@@ -227,6 +283,23 @@ private final class ResponseState {
     var itemsByID: [String: [String: Any]] = [:]
     var outputIndexByItemID: [String: Int] = [:]
     var orderedItemIDs: [String] = []
+    var terminalSeen = false
+    var lastSequenceNumber = 0
+
+    var hasRenderableOutput: Bool {
+        orderedItemIDs.contains { id in
+            guard let item = itemsByID[id] else { return false }
+            let type = item["type"] as? String ?? ""
+            if type == "message" {
+                let content = item["content"] as? [[String: Any]] ?? []
+                return content.contains { !(($0["text"] as? String) ?? "").isEmpty }
+            }
+            if type == "function_call" {
+                return !((item["arguments"] as? String) ?? "").isEmpty || item["name"] != nil
+            }
+            return true
+        }
+    }
 
     init(responseID: String) {
         self.responseID = responseID
