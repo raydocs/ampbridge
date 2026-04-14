@@ -73,6 +73,30 @@ final class OpenAIResponsesStreamRewriter {
         return Data("event: \(eventName)\ndata: \(text)\n\n".utf8)
     }
 
+    private func ampCompatibleItem(_ item: [String: Any]) -> [String: Any] {
+        guard let type = item["type"] as? String, type == "function_call" else {
+            return item
+        }
+
+        var mapped = item
+        mapped["type"] = "tool_use"
+        if mapped["name"] == nil, let name = item["name"] {
+            mapped["name"] = name
+        }
+
+        if mapped["input"] == nil {
+            if let arguments = item["arguments"] as? String,
+               let data = arguments.data(using: .utf8),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                mapped["input"] = json
+            } else {
+                mapped["input"] = [:]
+            }
+        }
+
+        return mapped
+    }
+
     private func nextEventRange(in data: Data) -> Range<Int>? {
         let bytes = [UInt8](data)
         if bytes.count < 2 { return nil }
@@ -116,6 +140,12 @@ final class OpenAIResponsesStreamRewriter {
         }
 
         applyEvent(type: type, json: json)
+
+        if type == "response.output_item.added" || type == "response.output_item.done" {
+            if var item = json["item"] as? [String: Any] {
+                json["item"] = ampCompatibleItem(item)
+            }
+        }
 
         if type == "response.completed",
            let response = json["response"] as? [String: Any],
@@ -395,6 +425,7 @@ private final class ResponseState {
         var response = upstream
         let upstreamOutput = response["output"] as? [[String: Any]] ?? []
         if !upstreamOutput.isEmpty {
+            response["output"] = upstreamOutput.map { normalizeCompletedItem($0) }
             return response
         }
 
@@ -414,9 +445,26 @@ private final class ResponseState {
             }
 
         if !synthesizedOutput.isEmpty {
-            response["output"] = synthesizedOutput
+            response["output"] = synthesizedOutput.map { normalizeCompletedItem($0) }
         }
         return response
+    }
+
+    private func normalizeCompletedItem(_ item: [String: Any]) -> [String: Any] {
+        var normalized = item
+        if let type = item["type"] as? String, type == "function_call" {
+            normalized["type"] = "tool_use"
+            if normalized["input"] == nil {
+                if let arguments = item["arguments"] as? String,
+                   let data = arguments.data(using: .utf8),
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    normalized["input"] = json
+                } else {
+                    normalized["input"] = [:]
+                }
+            }
+        }
+        return normalized
     }
 
     private func mergedPart(existing: [String: Any], incoming: [String: Any]) -> [String: Any] {
