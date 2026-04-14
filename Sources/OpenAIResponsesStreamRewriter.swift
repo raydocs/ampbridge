@@ -84,7 +84,7 @@ final class OpenAIResponsesStreamRewriter {
         }
 
         var mapped = item
-        mapped["type"] = "tool_use"
+        mapped["type"] = "function_call"
 
         if mapped["name"] == nil || ((mapped["name"] as? String)?.isEmpty ?? true) {
             if let name = item["name"] as? String, !name.isEmpty {
@@ -92,8 +92,14 @@ final class OpenAIResponsesStreamRewriter {
             }
         }
 
+        if let argumentsObject = item["arguments"] as? [String: Any],
+           let data = try? JSONSerialization.data(withJSONObject: argumentsObject),
+           let argumentsString = String(data: data, encoding: .utf8) {
+            mapped["arguments"] = argumentsString
+        }
+
         if mapped["input"] == nil {
-            if let arguments = item["arguments"] as? String,
+            if let arguments = mapped["arguments"] as? String,
                let data = arguments.data(using: .utf8),
                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 mapped["input"] = json
@@ -106,6 +112,10 @@ final class OpenAIResponsesStreamRewriter {
 
         if mapped["id"] == nil, let callID = item["call_id"] {
             mapped["id"] = callID
+        }
+
+        if mapped["call_id"] == nil, let id = mapped["id"] as? String, !id.isEmpty {
+            mapped["call_id"] = id
         }
 
         return mapped
@@ -466,16 +476,31 @@ private final class ResponseState {
 
     private func normalizeCompletedItem(_ item: [String: Any]) -> [String: Any] {
         var normalized = item
-        if let type = item["type"] as? String, type == "function_call" {
-            normalized["type"] = "tool_use"
+        if let type = item["type"] as? String,
+           ["function_call", "tool_use", "custom_tool_call"].contains(type) {
+            normalized["type"] = "function_call"
+
+            if let argumentsObject = item["arguments"] as? [String: Any],
+               let data = try? JSONSerialization.data(withJSONObject: argumentsObject),
+               let argumentsString = String(data: data, encoding: .utf8) {
+                normalized["arguments"] = argumentsString
+            }
+
             if normalized["input"] == nil {
-                if let arguments = item["arguments"] as? String,
+                if let arguments = normalized["arguments"] as? String,
                    let data = arguments.data(using: .utf8),
                    let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                     normalized["input"] = json
                 } else {
                     normalized["input"] = [:]
                 }
+            }
+
+            if normalized["id"] == nil, let callID = item["call_id"] {
+                normalized["id"] = callID
+            }
+            if normalized["call_id"] == nil, let id = normalized["id"] as? String, !id.isEmpty {
+                normalized["call_id"] = id
             }
         }
         return normalized

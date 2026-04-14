@@ -212,7 +212,7 @@ final class AmpBridgeServer {
         for (keyAny, valueAny) in response.allHeaderFields {
             guard let key = keyAny as? String else { continue }
             let lower = key.lowercased()
-            if lower == "content-length" || lower == "transfer-encoding" || lower == "connection" { continue }
+            if lower == "content-length" || lower == "transfer-encoding" || lower == "connection" || lower == "content-encoding" { continue }
             if forceStreaming && lower == "content-type" {
                 text += "Content-Type: text/event-stream\r\n"
                 continue
