@@ -1,0 +1,40 @@
+{
+  "": {
+    "swift-dependencies": "/Users/ruirui/ampbridge/.build/arm64-apple-macosx/debug/AmpBridge.build/master.swiftdeps"
+  },
+  "/Users/ruirui/ampbridge/Sources/AmpBridgeConfig.swift": {
+    "dependencies": "/Users/ruirui/ampbridge/.build/arm64-apple-macosx/debug/AmpBridge.build/AmpBridgeConfig.d",
+    "object": "/Users/ruirui/ampbridge/.build/arm64-apple-macosx/debug/AmpBridge.build/AmpBridgeConfig.swift.o",
+    "swiftmodule": "/Users/ruirui/ampbridge/.build/arm64-apple-macosx/debug/AmpBridge.build/AmpBridgeConfig~partial.swiftmodule",
+    "swift-dependencies": "/Users/ruirui/ampbridge/.build/arm64-apple-macosx/debug/AmpBridge.build/AmpBridgeConfig.swiftdeps",
+    "diagnostics": "/Users/ruirui/ampbridge/.build/arm64-apple-macosx/debug/AmpBridge.build/AmpBridgeConfig.dia"
+  },
+  "/Users/ruirui/ampbridge/Sources/AmpBridgeServer.swift": {
+    "dependencies": "/Users/ruirui/ampbridge/.build/arm64-apple-macosx/debug/AmpBridge.build/AmpBridgeServer.d",
+    "object": "/Users/ruirui/ampbridge/.build/arm64-apple-macosx/debug/AmpBridge.build/AmpBridgeServer.swift.o",
+    "swiftmodule": "/Users/ruirui/ampbridge/.build/arm64-apple-macosx/debug/AmpBridge.build/AmpBridgeServer~partial.swiftmodule",
+    "swift-dependencies": "/Users/ruirui/ampbridge/.build/arm64-apple-macosx/debug/AmpBridge.build/AmpBridgeServer.swiftdeps",
+    "diagnostics": "/Users/ruirui/ampbridge/.build/arm64-apple-macosx/debug/AmpBridge.build/AmpBridgeServer.dia"
+  },
+  "/Users/ruirui/ampbridge/Sources/OpenAIResponsesStreamRewriter.swift": {
+    "dependencies": "/Users/ruirui/ampbridge/.build/arm64-apple-macosx/debug/AmpBridge.build/OpenAIResponsesStreamRewriter.d",
+    "object": "/Users/ruirui/ampbridge/.build/arm64-apple-macosx/debug/AmpBridge.build/OpenAIResponsesStreamRewriter.swift.o",
+    "swiftmodule": "/Users/ruirui/ampbridge/.build/arm64-apple-macosx/debug/AmpBridge.build/OpenAIResponsesStreamRewriter~partial.swiftmodule",
+    "swift-dependencies": "/Users/ruirui/ampbridge/.build/arm64-apple-macosx/debug/AmpBridge.build/OpenAIResponsesStreamRewriter.swiftdeps",
+    "diagnostics": "/Users/ruirui/ampbridge/.build/arm64-apple-macosx/debug/AmpBridge.build/OpenAIResponsesStreamRewriter.dia"
+  },
+  "/Users/ruirui/ampbridge/Sources/RouteClassifier.swift": {
+    "dependencies": "/Users/ruirui/ampbridge/.build/arm64-apple-macosx/debug/AmpBridge.build/RouteClassifier.d",
+    "object": "/Users/ruirui/ampbridge/.build/arm64-apple-macosx/debug/AmpBridge.build/RouteClassifier.swift.o",
+    "swiftmodule": "/Users/ruirui/ampbridge/.build/arm64-apple-macosx/debug/AmpBridge.build/RouteClassifier~partial.swiftmodule",
+    "swift-dependencies": "/Users/ruirui/ampbridge/.build/arm64-apple-macosx/debug/AmpBridge.build/RouteClassifier.swiftdeps",
+    "diagnostics": "/Users/ruirui/ampbridge/.build/arm64-apple-macosx/debug/AmpBridge.build/RouteClassifier.dia"
+  },
+  "/Users/ruirui/ampbridge/Sources/main.swift": {
+    "dependencies": "/Users/ruirui/ampbridge/.build/arm64-apple-macosx/debug/AmpBridge.build/main.d",
+    "object": "/Users/ruirui/ampbridge/.build/arm64-apple-macosx/debug/AmpBridge.build/main.swift.o",
+    "swiftmodule": "/Users/ruirui/ampbridge/.build/arm64-apple-macosx/debug/AmpBridge.build/main~partial.swiftmodule",
+    "swift-dependencies": "/Users/ruirui/ampbridge/.build/arm64-apple-macosx/debug/AmpBridge.build/main.swiftdeps",
+    "diagnostics": "/Users/ruirui/ampbridge/.build/arm64-apple-macosx/debug/AmpBridge.build/main.dia"
+  }
+}

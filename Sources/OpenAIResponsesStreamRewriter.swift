@@ -1,0 +1,345 @@
+import Foundation
+
+final class OpenAIResponsesStreamRewriter {
+    private var pending = Data()
+    private var stateByResponseID: [String: ResponseState] = [:]
+    private var currentResponseID: String?
+
+    func process(_ data: Data, isComplete: Bool) -> Data {
+        pending.append(data)
+        var output = Data()
+
+        while let match = nextEventRange(in: pending) {
+            let eventData = pending.subdata(in: 0..<match.upperBound)
+            pending.removeSubrange(0..<match.upperBound)
+            output.append(rewriteEventBlock(eventData))
+        }
+
+        if isComplete, !pending.isEmpty {
+            output.append(rewriteEventBlock(pending))
+            pending.removeAll(keepingCapacity: false)
+        }
+
+        return output
+    }
+
+    private func nextEventRange(in data: Data) -> Range<Int>? {
+        let bytes = [UInt8](data)
+        if bytes.count < 2 { return nil }
+
+        var i = 0
+        while i < bytes.count - 1 {
+            if bytes[i] == 0x0A && bytes[i + 1] == 0x0A { // \n\n
+                return 0..<(i + 2)
+            }
+            if i < bytes.count - 3,
+               bytes[i] == 0x0D, bytes[i + 1] == 0x0A,
+               bytes[i + 2] == 0x0D, bytes[i + 3] == 0x0A { // \r\n\r\n
+                return 0..<(i + 4)
+            }
+            i += 1
+        }
+        return nil
+    }
+
+    private func rewriteEventBlock(_ data: Data) -> Data {
+        guard let text = String(data: data, encoding: .utf8) else { return data }
+
+        let delimiter = text.hasSuffix("\r\n\r\n") ? "\r\n\r\n" : (text.hasSuffix("\n\n") ? "\n\n" : "")
+        let body = delimiter.isEmpty ? text : String(text.dropLast(delimiter.count))
+        let lines = body.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n")
+
+        let dataLines = lines.filter { $0.hasPrefix("data:") }
+        guard !dataLines.isEmpty else { return data }
+
+        let payload = dataLines.map { line -> String in
+            let idx = line.index(line.startIndex, offsetBy: 5)
+            let raw = String(line[idx...])
+            return raw.hasPrefix(" ") ? String(raw.dropFirst()) : raw
+        }.joined(separator: "\n")
+
+        guard payload != "[DONE]",
+              let payloadData = payload.data(using: .utf8),
+              var json = (try? JSONSerialization.jsonObject(with: payloadData)) as? [String: Any],
+              let type = json["type"] as? String else {
+            return data
+        }
+
+        applyEvent(type: type, json: json)
+
+        if type == "response.completed",
+           let response = json["response"] as? [String: Any],
+           let responseID = response["id"] as? String,
+           let state = stateByResponseID[responseID] {
+            json["response"] = state.buildCompletedResponse(from: response)
+        }
+
+        guard let rewrittenData = try? JSONSerialization.data(withJSONObject: json),
+              let rewrittenJSON = String(data: rewrittenData, encoding: .utf8) else {
+            return data
+        }
+
+        var rebuilt: [String] = []
+        var replacedData = false
+        for line in lines {
+            if line.hasPrefix("data:") {
+                if !replacedData {
+                    rebuilt.append("data: \(rewrittenJSON)")
+                    replacedData = true
+                }
+            } else {
+                rebuilt.append(line)
+            }
+        }
+
+        let finalText = rebuilt.joined(separator: "\n") + delimiter
+        return Data(finalText.utf8)
+    }
+
+    private func applyEvent(type: String, json: [String: Any]) {
+        switch type {
+        case "response.created", "response.in_progress":
+            guard let response = json["response"] as? [String: Any],
+                  let responseID = response["id"] as? String else { return }
+            let state = stateByResponseID[responseID] ?? ResponseState(responseID: responseID)
+            currentResponseID = responseID
+            state.model = response["model"] as? String
+            state.status = response["status"] as? String
+            state.usage = response["usage"]
+            stateByResponseID[responseID] = state
+
+        case "response.output_item.added":
+            guard let item = json["item"] as? [String: Any],
+                  let itemID = item["id"] as? String,
+                  let outputIndex = json["output_index"] as? Int else { return }
+            let state = state(for: json, item: item)
+            state.itemsByID[itemID] = item
+            state.outputIndexByItemID[itemID] = outputIndex
+            if !state.orderedItemIDs.contains(itemID) {
+                state.orderedItemIDs.append(itemID)
+            }
+
+        case "response.content_part.added":
+            guard let itemID = json["item_id"] as? String,
+                  let contentIndex = json["content_index"] as? Int,
+                  let part = json["part"] as? [String: Any] else { return }
+            let state = state(for: json, itemID: itemID)
+            state.setContentPart(itemID: itemID, contentIndex: contentIndex, part: part)
+
+        case "response.output_text.delta":
+            guard let itemID = json["item_id"] as? String,
+                  let contentIndex = json["content_index"] as? Int,
+                  let delta = json["delta"] as? String else { return }
+            let state = state(for: json, itemID: itemID)
+            state.appendOutputText(itemID: itemID, contentIndex: contentIndex, delta: delta)
+
+        case "response.output_text.done":
+            guard let itemID = json["item_id"] as? String,
+                  let contentIndex = json["content_index"] as? Int else { return }
+            let finalText = json["text"] as? String
+            let state = state(for: json, itemID: itemID)
+            state.finishOutputText(itemID: itemID, contentIndex: contentIndex, finalText: finalText)
+
+        case "response.function_call_arguments.delta":
+            guard let itemID = json["item_id"] as? String,
+                  let delta = json["delta"] as? String else { return }
+            let state = state(for: json, itemID: itemID)
+            state.appendFunctionArguments(itemID: itemID, delta: delta)
+
+        case "response.function_call_arguments.done":
+            guard let itemID = json["item_id"] as? String else { return }
+            let arguments = json["arguments"] as? String
+            let state = state(for: json, itemID: itemID)
+            state.finishFunctionArguments(itemID: itemID, finalArguments: arguments)
+
+        case "response.output_item.done":
+            guard let item = json["item"] as? [String: Any],
+                  let itemID = item["id"] as? String else { return }
+            let state = state(for: json, item: item)
+            state.itemsByID[itemID] = item
+
+        case "response.completed", "response.failed", "response.incomplete":
+            guard let response = json["response"] as? [String: Any],
+                  let responseID = response["id"] as? String else { return }
+            let state = stateByResponseID[responseID] ?? ResponseState(responseID: responseID)
+            currentResponseID = responseID
+            state.status = response["status"] as? String
+            state.usage = response["usage"]
+            state.error = response["error"]
+            state.incompleteDetails = response["incomplete_details"]
+            stateByResponseID[responseID] = state
+
+        default:
+            break
+        }
+    }
+
+    private func state(for json: [String: Any], item: [String: Any]) -> ResponseState {
+        if let response = json["response"] as? [String: Any],
+           let responseID = response["id"] as? String {
+            let state = stateByResponseID[responseID] ?? ResponseState(responseID: responseID)
+            currentResponseID = responseID
+            stateByResponseID[responseID] = state
+            return state
+        }
+        if let currentResponseID,
+           let state = stateByResponseID[currentResponseID] {
+            return state
+        }
+        if let itemID = item["id"] as? String,
+           let existing = stateByResponseID.values.first(where: { $0.itemsByID[itemID] != nil }) {
+            return existing
+        }
+        let fallback = stateByResponseID["__fallback__"] ?? ResponseState(responseID: "__fallback__")
+        stateByResponseID["__fallback__"] = fallback
+        return fallback
+    }
+
+    private func state(for json: [String: Any], itemID: String) -> ResponseState {
+        if let existing = stateByResponseID.values.first(where: { $0.itemsByID[itemID] != nil }) {
+            return existing
+        }
+        if let response = json["response"] as? [String: Any],
+           let responseID = response["id"] as? String {
+            let state = stateByResponseID[responseID] ?? ResponseState(responseID: responseID)
+            currentResponseID = responseID
+            stateByResponseID[responseID] = state
+            return state
+        }
+        if let currentResponseID,
+           let state = stateByResponseID[currentResponseID] {
+            return state
+        }
+        let fallback = stateByResponseID["__fallback__"] ?? ResponseState(responseID: "__fallback__")
+        stateByResponseID["__fallback__"] = fallback
+        return fallback
+    }
+}
+
+private final class ResponseState {
+    let responseID: String
+    var model: String?
+    var status: String?
+    var usage: Any?
+    var error: Any?
+    var incompleteDetails: Any?
+    var itemsByID: [String: [String: Any]] = [:]
+    var outputIndexByItemID: [String: Int] = [:]
+    var orderedItemIDs: [String] = []
+
+    init(responseID: String) {
+        self.responseID = responseID
+    }
+
+    func setContentPart(itemID: String, contentIndex: Int, part: [String: Any]) {
+        ensureItemExists(itemID: itemID)
+        var item = itemsByID[itemID] ?? [:]
+        var content = item["content"] as? [[String: Any]] ?? []
+        while content.count <= contentIndex { content.append([:]) }
+        content[contentIndex] = mergedPart(existing: content[contentIndex], incoming: part)
+        item["content"] = content
+        itemsByID[itemID] = item
+    }
+
+    func appendOutputText(itemID: String, contentIndex: Int, delta: String) {
+        ensureItemExists(itemID: itemID)
+        var item = itemsByID[itemID] ?? [:]
+        var content = item["content"] as? [[String: Any]] ?? []
+        while content.count <= contentIndex { content.append(["type": "output_text", "text": "", "annotations": []]) }
+        var part = content[contentIndex]
+        let existingText = part["text"] as? String ?? ""
+        if part["type"] == nil { part["type"] = "output_text" }
+        if part["annotations"] == nil { part["annotations"] = [] }
+        part["text"] = existingText + delta
+        content[contentIndex] = part
+        item["content"] = content
+        itemsByID[itemID] = item
+    }
+
+    func finishOutputText(itemID: String, contentIndex: Int, finalText: String?) {
+        ensureItemExists(itemID: itemID)
+        guard var item = itemsByID[itemID] else { return }
+        var content = item["content"] as? [[String: Any]] ?? []
+        while content.count <= contentIndex { content.append(["type": "output_text", "text": "", "annotations": []]) }
+        var part = content[contentIndex]
+        if let finalText { part["text"] = finalText }
+        if part["type"] == nil { part["type"] = "output_text" }
+        if part["annotations"] == nil { part["annotations"] = [] }
+        content[contentIndex] = part
+        item["content"] = content
+        itemsByID[itemID] = item
+    }
+
+    func appendFunctionArguments(itemID: String, delta: String) {
+        ensureItemExists(itemID: itemID)
+        var item = itemsByID[itemID] ?? [:]
+        let existing = item["arguments"] as? String ?? ""
+        item["arguments"] = existing + delta
+        itemsByID[itemID] = item
+    }
+
+    func finishFunctionArguments(itemID: String, finalArguments: String?) {
+        ensureItemExists(itemID: itemID)
+        guard var item = itemsByID[itemID] else { return }
+        if let finalArguments { item["arguments"] = finalArguments }
+        itemsByID[itemID] = item
+    }
+
+    func buildCompletedResponse(from upstream: [String: Any]) -> [String: Any] {
+        var response = upstream
+        let upstreamOutput = response["output"] as? [[String: Any]] ?? []
+        if !upstreamOutput.isEmpty {
+            return response
+        }
+
+        let synthesizedOutput = orderedItemIDs
+            .sorted { (outputIndexByItemID[$0] ?? .max) < (outputIndexByItemID[$1] ?? .max) }
+            .compactMap { itemsByID[$0] }
+            .filter { item in
+                let type = item["type"] as? String ?? ""
+                if type == "message" {
+                    let content = item["content"] as? [[String: Any]] ?? []
+                    return content.contains { (($0["text"] as? String) ?? "").isEmpty == false }
+                }
+                if type == "function_call" {
+                    return ((item["arguments"] as? String) ?? "").isEmpty == false || item["name"] != nil
+                }
+                return true
+            }
+
+        if !synthesizedOutput.isEmpty {
+            response["output"] = synthesizedOutput
+        }
+        return response
+    }
+
+    private func mergedPart(existing: [String: Any], incoming: [String: Any]) -> [String: Any] {
+        var merged = existing
+        for (key, value) in incoming {
+            if key == "text", let incomingText = value as? String {
+                let existingText = merged["text"] as? String ?? ""
+                merged["text"] = existingText.isEmpty ? incomingText : existingText
+            } else {
+                merged[key] = value
+            }
+        }
+        if merged["annotations"] == nil { merged["annotations"] = [] }
+        return merged
+    }
+
+    private func ensureItemExists(itemID: String) {
+        if itemsByID[itemID] == nil {
+            itemsByID[itemID] = [
+                "id": itemID,
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "phase": "final_answer",
+                "content": []
+            ]
+        }
+        if !orderedItemIDs.contains(itemID) {
+            orderedItemIDs.append(itemID)
+        }
+    }
+}
