@@ -113,7 +113,7 @@ final class OpenAIResponsesStreamRewriter {
                   let itemID = item["id"] as? String,
                   let outputIndex = json["output_index"] as? Int else { return }
             let state = state(for: json, item: item)
-            state.itemsByID[itemID] = item
+            state.upsertItem(itemID: itemID, incoming: item, responseJSON: json["response"] as? [String: Any])
             state.outputIndexByItemID[itemID] = outputIndex
             if !state.orderedItemIDs.contains(itemID) {
                 state.orderedItemIDs.append(itemID)
@@ -156,7 +156,7 @@ final class OpenAIResponsesStreamRewriter {
             guard let item = json["item"] as? [String: Any],
                   let itemID = item["id"] as? String else { return }
             let state = state(for: json, item: item)
-            state.itemsByID[itemID] = item
+            state.upsertItem(itemID: itemID, incoming: item, responseJSON: json["response"] as? [String: Any])
 
         case "response.completed", "response.failed", "response.incomplete":
             guard let response = json["response"] as? [String: Any],
@@ -167,6 +167,7 @@ final class OpenAIResponsesStreamRewriter {
             state.usage = response["usage"]
             state.error = response["error"]
             state.incompleteDetails = response["incomplete_details"]
+            state.backfillNamesFromCompletedResponse(response)
             stateByResponseID[responseID] = state
 
         default:
@@ -229,6 +230,38 @@ private final class ResponseState {
 
     init(responseID: String) {
         self.responseID = responseID
+    }
+
+    func upsertItem(itemID: String, incoming: [String: Any], responseJSON: [String: Any]?) {
+        var merged = itemsByID[itemID] ?? [:]
+        for (key, value) in incoming {
+            if key == "content",
+               let existingContent = merged["content"] as? [[String: Any]],
+               let incomingContent = value as? [[String: Any]],
+               !existingContent.isEmpty,
+               incomingContent.isEmpty {
+                continue
+            }
+            merged[key] = value
+        }
+
+        if (merged["name"] as? String)?.isEmpty ?? true {
+            if let incomingName = incoming["name"] as? String, !incomingName.isEmpty {
+                merged["name"] = incomingName
+            } else if let inferredName = inferToolName(for: itemID, item: merged, responseJSON: responseJSON) {
+                merged["name"] = inferredName
+            }
+        }
+
+        itemsByID[itemID] = merged
+    }
+
+    func backfillNamesFromCompletedResponse(_ response: [String: Any]) {
+        guard let output = response["output"] as? [[String: Any]] else { return }
+        for item in output {
+            guard let itemID = item["id"] as? String else { continue }
+            upsertItem(itemID: itemID, incoming: item, responseJSON: response)
+        }
     }
 
     func setContentPart(itemID: String, contentIndex: Int, part: [String: Any]) {
@@ -341,5 +374,26 @@ private final class ResponseState {
         if !orderedItemIDs.contains(itemID) {
             orderedItemIDs.append(itemID)
         }
+    }
+
+    private func inferToolName(for itemID: String, item: [String: Any], responseJSON: [String: Any]?) -> String? {
+        if let name = item["name"] as? String, !name.isEmpty {
+            return name
+        }
+        if let responseJSON,
+           let output = responseJSON["output"] as? [[String: Any]],
+           let match = output.first(where: { ($0["id"] as? String) == itemID }),
+           let matchName = match["name"] as? String,
+           !matchName.isEmpty {
+            return matchName
+        }
+        if let responseJSON,
+           let tools = responseJSON["tools"] as? [[String: Any]],
+           tools.count == 1,
+           let onlyToolName = tools.first?["name"] as? String,
+           !onlyToolName.isEmpty {
+            return onlyToolName
+        }
+        return nil
     }
 }
