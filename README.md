@@ -26,7 +26,30 @@ Current status:
 - Initial project scaffold created
 - OpenAI Responses stream rewriter ported in
 - Route model documented
-- Server/runtime implementation still in progress
+- Request parser / response writer helpers added
+- Runnable server/runtime implementation still in progress
+
+## Note on current VibeProxy AMP behavior
+
+From tracing AMP traffic through VibeProxy, the stable request pattern looks like:
+
+1. `/api/internal?...`
+2. `/api/provider/anthropic/v1/messages`
+3. `/api/provider/openai/v1/responses`
+4. back to `/api/provider/anthropic/v1/messages`
+5. `/api/internal?setThreadMeta`
+
+Interpretation:
+
+- `internal` = AMP product/session/thread backend
+- `anthropic/messages` = smart/runtime/tool orchestration shell
+- `openai/responses` = deep reasoning path
+
+Observed bug in existing VibeProxy behavior:
+
+- OpenAI deep path was dropping final `response.output` in `response.completed`
+- This broke AMP final response bubbles even when streamed text was visible
+- Claude smart mode appears to have a separate issue where thread state can stop updating correctly after routing through local Claude OAuth, likely due to runtime/provider adaptation rather than AMP internal APIs themselves
 
 ## Why this project exists
 
