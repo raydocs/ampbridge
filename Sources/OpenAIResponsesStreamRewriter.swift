@@ -74,14 +74,22 @@ final class OpenAIResponsesStreamRewriter {
     }
 
     private func ampCompatibleItem(_ item: [String: Any]) -> [String: Any] {
-        guard let type = item["type"] as? String, type == "function_call" else {
+        guard let rawType = item["type"] as? String else {
+            return item
+        }
+
+        let toolLikeTypes = Set(["function_call", "tool_use", "custom_tool_call"])
+        guard toolLikeTypes.contains(rawType) else {
             return item
         }
 
         var mapped = item
         mapped["type"] = "tool_use"
-        if mapped["name"] == nil, let name = item["name"] {
-            mapped["name"] = name
+
+        if mapped["name"] == nil || ((mapped["name"] as? String)?.isEmpty ?? true) {
+            if let name = item["name"] as? String, !name.isEmpty {
+                mapped["name"] = name
+            }
         }
 
         if mapped["input"] == nil {
@@ -89,9 +97,15 @@ final class OpenAIResponsesStreamRewriter {
                let data = arguments.data(using: .utf8),
                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 mapped["input"] = json
+            } else if let arguments = item["arguments"] as? [String: Any] {
+                mapped["input"] = arguments
             } else {
                 mapped["input"] = [:]
             }
+        }
+
+        if mapped["id"] == nil, let callID = item["call_id"] {
+            mapped["id"] = callID
         }
 
         return mapped
