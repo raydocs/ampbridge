@@ -24,7 +24,7 @@ Route behavior:
 4. `/api/provider/openai/v1/responses...` → local provider backend, path rewritten to `/v1/responses...`, SSE rewrite enabled only for `text/event-stream`
 5. `/api/provider/openai/...` → local provider backend, path rewritten by stripping `/api/provider/openai`
 6. `/v1/...` and `/api/v1/...` → local provider backend unchanged
-7. other `/api/provider/...` routes → `501 Unsupported provider`
+7. other `/api/provider/...` routes → official AMP backend
 8. unknown routes → official AMP backend
 
 ## Current protocol/runtime behavior

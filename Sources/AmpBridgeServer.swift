@@ -125,8 +125,8 @@ final class AmpBridgeServer {
                 writer.sendError(on: connection, statusCode: 501, message: "OpenAI provider disabled")
             }
 
-        case .unsupportedProvider:
-            writer.sendError(on: connection, statusCode: 501, message: "Unsupported provider")
+        case .providerOfficialPassthrough:
+            proxyOfficial(request: request, connection: connection)
 
         case .passthroughLocal:
             proxyLocalProvider(request: request, connection: connection)

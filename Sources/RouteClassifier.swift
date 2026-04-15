@@ -7,7 +7,7 @@ enum BridgeRoute: Equatable {
     case openAIResponses
     case openAIProviderPassthrough
     case passthroughLocal
-    case unsupportedProvider
+    case providerOfficialPassthrough
     case unknown
 }
 
@@ -32,7 +32,7 @@ enum RouteClassifier {
             return .passthroughLocal
         }
         if path.hasPrefix("/api/provider/") {
-            return .unsupportedProvider
+            return .providerOfficialPassthrough
         }
         return .unknown
     }
