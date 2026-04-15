@@ -229,7 +229,7 @@ final class AmpBridgeServer {
                 if activeRewrite {
                     let rewriter = OpenAIResponsesStreamRewriter()
                     var buffer = Data()
-                    var reachedLogicalEnd = false
+                    var shouldCloseDownstream = false
 
                     while let byte = try await iterator.next() {
                         buffer.append(byte)
@@ -239,15 +239,15 @@ final class AmpBridgeServer {
                                 try await self.sendData(result.output, on: connection)
                             }
                             buffer.removeAll(keepingCapacity: true)
-                            if result.reachedLogicalEnd {
-                                print("AmpBridge SSE logical end reached for \(request.path)")
-                                reachedLogicalEnd = true
+                            if result.shouldCloseDownstream {
+                                print("AmpBridge SSE close signal reached for \(request.path)")
+                                shouldCloseDownstream = true
                                 break
                             }
                         }
                     }
 
-                    if !reachedLogicalEnd {
+                    if !shouldCloseDownstream {
                         let finalResult = rewriter.process(buffer, isTransportComplete: true)
                         if !finalResult.output.isEmpty {
                             try await self.sendData(finalResult.output, on: connection)

@@ -2,27 +2,25 @@ import Foundation
 
 struct StreamRewriteResult {
     let output: Data
-    let reachedLogicalEnd: Bool
+    let shouldCloseDownstream: Bool
 }
 
 final class OpenAIResponsesStreamRewriter {
     private var pending = Data()
     private var stateByResponseID: [String: ResponseState] = [:]
     private var currentResponseID: String?
-    private var logicalEndSeen = false
-
     func process(_ data: Data, isTransportComplete: Bool) -> StreamRewriteResult {
         pending.append(data)
         var output = Data()
-        var reachedLogicalEnd = false
+        var shouldCloseDownstream = false
 
         while let match = nextEventRange(in: pending) {
             let eventData = pending.subdata(in: 0..<match.upperBound)
             pending.removeSubrange(0..<match.upperBound)
             let result = rewriteEventBlock(eventData)
             output.append(result.output)
-            if result.reachedLogicalEnd {
-                reachedLogicalEnd = true
+            if result.shouldCloseDownstream {
+                shouldCloseDownstream = true
                 pending.removeAll(keepingCapacity: false)
                 break
             }
@@ -31,29 +29,44 @@ final class OpenAIResponsesStreamRewriter {
         if isTransportComplete, !pending.isEmpty {
             let result = rewriteEventBlock(pending)
             output.append(result.output)
-            if result.reachedLogicalEnd {
-                reachedLogicalEnd = true
-            }
+            shouldCloseDownstream = shouldCloseDownstream || result.shouldCloseDownstream
             pending.removeAll(keepingCapacity: false)
         }
 
         if isTransportComplete,
-           !logicalEndSeen,
-           let currentResponseID,
-           let state = stateByResponseID[currentResponseID],
-           !state.terminalSeen,
-           let synthesized = synthesizeTerminalEvent(for: state) {
-            output.append(synthesized)
-            reachedLogicalEnd = true
+           let state = currentState(),
+           let terminalEvent = terminalEventForStreamEnd(for: state) {
+            output.append(terminalEvent)
         }
 
-        return StreamRewriteResult(output: output, reachedLogicalEnd: reachedLogicalEnd)
+        if isTransportComplete {
+            shouldCloseDownstream = true
+        }
+
+        return StreamRewriteResult(output: output, shouldCloseDownstream: shouldCloseDownstream)
     }
 
-    private func synthesizeTerminalEvent(for state: ResponseState) -> Data? {
+    private func currentState() -> ResponseState? {
+        if let currentResponseID,
+           let state = stateByResponseID[currentResponseID] {
+            return state
+        }
+        return stateByResponseID.values.max(by: { $0.lastSequenceNumber < $1.lastSequenceNumber })
+    }
+
+    private func terminalEventForStreamEnd(for state: ResponseState) -> Data? {
+        if state.terminalSeen {
+            guard state.terminalNeedsRefresh, state.status == "completed" else { return nil }
+            return makeTerminalEvent(for: state, incompleteReason: nil)
+        }
+        return makeTerminalEvent(for: state, incompleteReason: "stream_ended_unexpectedly")
+    }
+
+    private func makeTerminalEvent(for state: ResponseState, incompleteReason: String?) -> Data? {
         let sequenceNumber = state.lastSequenceNumber + 1
         state.lastSequenceNumber = sequenceNumber
         state.terminalSeen = true
+        state.terminalNeedsRefresh = false
 
         if state.hasRenderableOutput {
             state.status = "completed"
@@ -79,7 +92,8 @@ final class OpenAIResponsesStreamRewriter {
 
         state.status = "incomplete"
         state.error = NSNull()
-        state.incompleteDetails = ["reason": "stream_ended_unexpectedly"]
+        let reason = incompleteReason ?? "stream_ended_unexpectedly"
+        state.incompleteDetails = ["reason": reason]
         let response: [String: Any] = [
             "id": state.responseID,
             "object": "response",
@@ -88,7 +102,7 @@ final class OpenAIResponsesStreamRewriter {
             "output": [],
             "usage": state.usage as Any,
             "error": NSNull(),
-            "incomplete_details": ["reason": "stream_ended_unexpectedly"]
+            "incomplete_details": ["reason": reason]
         ]
         let event: [String: Any] = [
             "type": "response.incomplete",
@@ -173,7 +187,7 @@ final class OpenAIResponsesStreamRewriter {
 
     private func rewriteEventBlock(_ data: Data) -> StreamRewriteResult {
         guard let text = String(data: data, encoding: .utf8) else {
-            return StreamRewriteResult(output: data, reachedLogicalEnd: false)
+            return StreamRewriteResult(output: data, shouldCloseDownstream: false)
         }
 
         let delimiter = text.hasSuffix("\r\n\r\n") ? "\r\n\r\n" : (text.hasSuffix("\n\n") ? "\n\n" : "")
@@ -182,7 +196,7 @@ final class OpenAIResponsesStreamRewriter {
 
         let dataLines = lines.filter { $0.hasPrefix("data:") }
         guard !dataLines.isEmpty else {
-            return StreamRewriteResult(output: data, reachedLogicalEnd: false)
+            return StreamRewriteResult(output: data, shouldCloseDownstream: false)
         }
 
         let payload = dataLines.map { line -> String in
@@ -192,29 +206,22 @@ final class OpenAIResponsesStreamRewriter {
         }.joined(separator: "\n")
 
         if payload == "[DONE]" {
-            logicalEndSeen = true
             var output = Data()
-            if let currentResponseID,
-               let state = stateByResponseID[currentResponseID],
-               !state.terminalSeen,
-               let synthesized = synthesizeTerminalEvent(for: state) {
-                output.append(synthesized)
+            if let state = currentState(),
+               let terminalEvent = terminalEventForStreamEnd(for: state) {
+                output.append(terminalEvent)
             }
             output.append(data)
-            return StreamRewriteResult(output: output, reachedLogicalEnd: true)
+            return StreamRewriteResult(output: output, shouldCloseDownstream: true)
         }
 
         guard let payloadData = payload.data(using: .utf8),
               var json = (try? JSONSerialization.jsonObject(with: payloadData)) as? [String: Any],
               let type = json["type"] as? String else {
-            return StreamRewriteResult(output: data, reachedLogicalEnd: false)
+            return StreamRewriteResult(output: data, shouldCloseDownstream: false)
         }
 
         applyEvent(type: type, json: json)
-        let reachedLogicalEnd = isTerminalEventType(type)
-        if reachedLogicalEnd {
-            logicalEndSeen = true
-        }
 
         if type == "response.output_item.added" || type == "response.output_item.done" {
             if let item = json["item"] as? [String: Any] {
@@ -231,7 +238,7 @@ final class OpenAIResponsesStreamRewriter {
 
         guard let rewrittenData = try? JSONSerialization.data(withJSONObject: json),
               let rewrittenJSON = String(data: rewrittenData, encoding: .utf8) else {
-            return StreamRewriteResult(output: data, reachedLogicalEnd: false)
+            return StreamRewriteResult(output: data, shouldCloseDownstream: false)
         }
 
         var rebuilt: [String] = []
@@ -248,11 +255,7 @@ final class OpenAIResponsesStreamRewriter {
         }
 
         let finalText = rebuilt.joined(separator: "\n") + delimiter
-        return StreamRewriteResult(output: Data(finalText.utf8), reachedLogicalEnd: reachedLogicalEnd)
-    }
-
-    private func isTerminalEventType(_ type: String) -> Bool {
-        type == "response.completed" || type == "response.incomplete" || type == "response.failed"
+        return StreamRewriteResult(output: Data(finalText.utf8), shouldCloseDownstream: false)
     }
 
     private func applyEvent(type: String, json: [String: Any]) {
@@ -286,6 +289,14 @@ final class OpenAIResponsesStreamRewriter {
                   let part = json["part"] as? [String: Any] else { return }
             let state = state(for: json, itemID: itemID)
             state.setContentPart(itemID: itemID, contentIndex: contentIndex, part: part)
+            state.lastSequenceNumber = max(state.lastSequenceNumber, json["sequence_number"] as? Int ?? 0)
+
+        case "response.content_part.done":
+            guard let itemID = json["item_id"] as? String,
+                  let contentIndex = json["content_index"] as? Int,
+                  let part = json["part"] as? [String: Any] else { return }
+            let state = state(for: json, itemID: itemID)
+            state.finishContentPart(itemID: itemID, contentIndex: contentIndex, part: part)
             state.lastSequenceNumber = max(state.lastSequenceNumber, json["sequence_number"] as? Int ?? 0)
 
         case "response.output_text.delta":
@@ -336,6 +347,7 @@ final class OpenAIResponsesStreamRewriter {
             state.incompleteDetails = response["incomplete_details"]
             state.backfillNamesFromCompletedResponse(response)
             state.terminalSeen = true
+            state.terminalNeedsRefresh = false
             state.lastSequenceNumber = max(state.lastSequenceNumber, json["sequence_number"] as? Int ?? 0)
             stateByResponseID[responseID] = state
 
@@ -400,20 +412,13 @@ private final class ResponseState {
     var outputIndexByItemID: [String: Int] = [:]
     var orderedItemIDs: [String] = []
     var terminalSeen = false
+    var terminalNeedsRefresh = false
     var lastSequenceNumber = 0
 
     var hasRenderableOutput: Bool {
         orderedItemIDs.contains { id in
             guard let item = itemsByID[id] else { return false }
-            let type = item["type"] as? String ?? ""
-            if type == "message" {
-                let content = item["content"] as? [[String: Any]] ?? []
-                return content.contains { !(($0["text"] as? String) ?? "").isEmpty }
-            }
-            if type == "function_call" {
-                return !((item["arguments"] as? String) ?? "").isEmpty || item["name"] != nil
-            }
-            return true
+            return itemIsRenderableForCompletion(item)
         }
     }
 
@@ -443,6 +448,7 @@ private final class ResponseState {
         }
 
         itemsByID[itemID] = merged
+        markTerminalNeedsRefresh()
     }
 
     func backfillNamesFromCompletedResponse(_ response: [String: Any]) {
@@ -458,9 +464,21 @@ private final class ResponseState {
         var item = itemsByID[itemID] ?? [:]
         var content = item["content"] as? [[String: Any]] ?? []
         while content.count <= contentIndex { content.append([:]) }
-        content[contentIndex] = mergedPart(existing: content[contentIndex], incoming: part)
+        content[contentIndex] = mergeAddedPart(existing: content[contentIndex], incoming: part)
         item["content"] = content
         itemsByID[itemID] = item
+        markTerminalNeedsRefresh()
+    }
+
+    func finishContentPart(itemID: String, contentIndex: Int, part: [String: Any]) {
+        ensureItemExists(itemID: itemID)
+        var item = itemsByID[itemID] ?? [:]
+        var content = item["content"] as? [[String: Any]] ?? []
+        while content.count <= contentIndex { content.append([:]) }
+        content[contentIndex] = mergeFinalizedPart(existing: content[contentIndex], incoming: part)
+        item["content"] = content
+        itemsByID[itemID] = item
+        markTerminalNeedsRefresh()
     }
 
     func appendOutputText(itemID: String, contentIndex: Int, delta: String) {
@@ -476,6 +494,7 @@ private final class ResponseState {
         content[contentIndex] = part
         item["content"] = content
         itemsByID[itemID] = item
+        markTerminalNeedsRefresh()
     }
 
     func finishOutputText(itemID: String, contentIndex: Int, finalText: String?) {
@@ -490,6 +509,7 @@ private final class ResponseState {
         content[contentIndex] = part
         item["content"] = content
         itemsByID[itemID] = item
+        markTerminalNeedsRefresh()
     }
 
     func appendFunctionArguments(itemID: String, delta: String) {
@@ -498,6 +518,7 @@ private final class ResponseState {
         let existing = item["arguments"] as? String ?? ""
         item["arguments"] = existing + delta
         itemsByID[itemID] = item
+        markTerminalNeedsRefresh()
     }
 
     func finishFunctionArguments(itemID: String, finalArguments: String?) {
@@ -505,6 +526,7 @@ private final class ResponseState {
         guard var item = itemsByID[itemID] else { return }
         if let finalArguments { item["arguments"] = finalArguments }
         itemsByID[itemID] = item
+        markTerminalNeedsRefresh()
     }
 
     func buildCompletedResponse(from upstream: [String: Any]) -> [String: Any] {
@@ -518,22 +540,31 @@ private final class ResponseState {
         let synthesizedOutput = orderedItemIDs
             .sorted { (outputIndexByItemID[$0] ?? .max) < (outputIndexByItemID[$1] ?? .max) }
             .compactMap { itemsByID[$0] }
-            .filter { item in
-                let type = item["type"] as? String ?? ""
-                if type == "message" {
-                    let content = item["content"] as? [[String: Any]] ?? []
-                    return content.contains { (($0["text"] as? String) ?? "").isEmpty == false }
-                }
-                if type == "function_call" {
-                    return ((item["arguments"] as? String) ?? "").isEmpty == false || item["name"] != nil
-                }
-                return true
-            }
+            .filter { itemIsRenderableForCompletion($0) }
 
         if !synthesizedOutput.isEmpty {
             response["output"] = synthesizedOutput.map { normalizeCompletedItem($0) }
         }
         return response
+    }
+
+    private func itemIsRenderableForCompletion(_ item: [String: Any]) -> Bool {
+        let type = item["type"] as? String ?? ""
+        if type == "message" {
+            let content = item["content"] as? [[String: Any]] ?? []
+            return content.contains { partHasRenderableFinalText($0) }
+        }
+        if type == "function_call" {
+            return !((item["arguments"] as? String) ?? "").isEmpty || item["name"] != nil
+        }
+        return false
+    }
+
+    private func partHasRenderableFinalText(_ part: [String: Any]) -> Bool {
+        let text = (part["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !text.isEmpty else { return false }
+        let type = (part["type"] as? String)?.lowercased() ?? ""
+        return type != "reasoning" && type != "thinking"
     }
 
     private func normalizeCompletedItem(_ item: [String: Any]) -> [String: Any] {
@@ -568,7 +599,7 @@ private final class ResponseState {
         return normalized
     }
 
-    private func mergedPart(existing: [String: Any], incoming: [String: Any]) -> [String: Any] {
+    private func mergeAddedPart(existing: [String: Any], incoming: [String: Any]) -> [String: Any] {
         var merged = existing
         for (key, value) in incoming {
             if key == "text", let incomingText = value as? String {
@@ -577,6 +608,15 @@ private final class ResponseState {
             } else {
                 merged[key] = value
             }
+        }
+        if merged["annotations"] == nil { merged["annotations"] = [] }
+        return merged
+    }
+
+    private func mergeFinalizedPart(existing: [String: Any], incoming: [String: Any]) -> [String: Any] {
+        var merged = existing
+        for (key, value) in incoming {
+            merged[key] = value
         }
         if merged["annotations"] == nil { merged["annotations"] = [] }
         return merged
@@ -595,6 +635,12 @@ private final class ResponseState {
         }
         if !orderedItemIDs.contains(itemID) {
             orderedItemIDs.append(itemID)
+        }
+    }
+
+    private func markTerminalNeedsRefresh() {
+        if terminalSeen {
+            terminalNeedsRefresh = true
         }
     }
 

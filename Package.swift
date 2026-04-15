@@ -16,6 +16,13 @@ let package = Package(
         .executableTarget(
             name: "AmpBridge",
             path: "Sources"
+        ),
+        .testTarget(
+            name: "AmpBridgeTests",
+            dependencies: ["AmpBridge"],
+            resources: [
+                .process("Fixtures")
+            ]
         )
     ]
 )
