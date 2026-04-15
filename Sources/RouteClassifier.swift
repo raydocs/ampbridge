@@ -3,37 +3,49 @@ import Foundation
 enum BridgeRoute: Equatable {
     case auth
     case internalAPI
-    case anthropicMessages
+    case anthropicProvider
     case openAIResponses
-    case openAIChatCompletions
-    case unsupportedProvider
+    case openAIProviderPassthrough
     case passthroughLocal
+    case unsupportedProvider
     case unknown
 }
 
 enum RouteClassifier {
     static func classify(method: String, path: String) -> BridgeRoute {
-        if path.hasPrefix("/auth/cli-login") || path.hasPrefix("/api/auth/cli-login") {
+        if matchesSegmentPrefix(path, prefix: "/auth/cli-login") || matchesSegmentPrefix(path, prefix: "/api/auth/cli-login") {
             return .auth
         }
-        if path.hasPrefix("/api/internal") {
+        if matchesSegmentPrefix(path, prefix: "/api/internal") {
             return .internalAPI
         }
-        if path.hasPrefix("/api/provider/anthropic/v1/messages") {
-            return .anthropicMessages
+        if path.hasPrefix("/api/provider/anthropic/") {
+            return .anthropicProvider
         }
-        if path.hasPrefix("/api/provider/openai/v1/responses") {
+        if matchesSegmentPrefix(path, prefix: "/api/provider/openai/v1/responses") {
             return .openAIResponses
         }
-        if path.hasPrefix("/api/provider/openai/v1/chat/completions") {
-            return .openAIChatCompletions
-        }
-        if path.hasPrefix("/api/provider/") {
-            return .unsupportedProvider
+        if path.hasPrefix("/api/provider/openai/") {
+            return .openAIProviderPassthrough
         }
         if path.hasPrefix("/v1/") || path.hasPrefix("/api/v1/") {
             return .passthroughLocal
         }
+        if path.hasPrefix("/api/provider/") {
+            return .unsupportedProvider
+        }
         return .unknown
+    }
+
+    private static func matchesSegmentPrefix(_ path: String, prefix: String) -> Bool {
+        guard path.hasPrefix(prefix) else {
+            return false
+        }
+        guard path.count > prefix.count else {
+            return true
+        }
+
+        let nextCharacter = path[path.index(path.startIndex, offsetBy: prefix.count)]
+        return nextCharacter == "/" || nextCharacter == "?"
     }
 }

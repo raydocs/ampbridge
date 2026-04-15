@@ -1,36 +1,64 @@
 import Foundation
 
+struct StreamRewriteResult {
+    let output: Data
+    let reachedLogicalEnd: Bool
+}
+
 final class OpenAIResponsesStreamRewriter {
     private var pending = Data()
     private var stateByResponseID: [String: ResponseState] = [:]
     private var currentResponseID: String?
+    private var logicalEndSeen = false
 
-    func process(_ data: Data, isComplete: Bool) -> Data {
+    func process(_ data: Data, isTransportComplete: Bool) -> StreamRewriteResult {
         pending.append(data)
         var output = Data()
+        var reachedLogicalEnd = false
 
         while let match = nextEventRange(in: pending) {
             let eventData = pending.subdata(in: 0..<match.upperBound)
             pending.removeSubrange(0..<match.upperBound)
-            output.append(rewriteEventBlock(eventData))
+            let result = rewriteEventBlock(eventData)
+            output.append(result.output)
+            if result.reachedLogicalEnd {
+                reachedLogicalEnd = true
+                pending.removeAll(keepingCapacity: false)
+                break
+            }
         }
 
-        if isComplete, !pending.isEmpty {
-            output.append(rewriteEventBlock(pending))
+        if isTransportComplete, !pending.isEmpty {
+            let result = rewriteEventBlock(pending)
+            output.append(result.output)
+            if result.reachedLogicalEnd {
+                reachedLogicalEnd = true
+            }
             pending.removeAll(keepingCapacity: false)
         }
 
-        if isComplete, let currentResponseID, let state = stateByResponseID[currentResponseID], !state.terminalSeen,
+        if isTransportComplete,
+           !logicalEndSeen,
+           let currentResponseID,
+           let state = stateByResponseID[currentResponseID],
+           !state.terminalSeen,
            let synthesized = synthesizeTerminalEvent(for: state) {
             output.append(synthesized)
+            reachedLogicalEnd = true
         }
 
-        return output
+        return StreamRewriteResult(output: output, reachedLogicalEnd: reachedLogicalEnd)
     }
 
     private func synthesizeTerminalEvent(for state: ResponseState) -> Data? {
         let sequenceNumber = state.lastSequenceNumber + 1
+        state.lastSequenceNumber = sequenceNumber
+        state.terminalSeen = true
+
         if state.hasRenderableOutput {
+            state.status = "completed"
+            state.error = NSNull()
+            state.incompleteDetails = NSNull()
             let response = state.buildCompletedResponse(from: [
                 "id": state.responseID,
                 "object": "response",
@@ -49,6 +77,9 @@ final class OpenAIResponsesStreamRewriter {
             return encodeSSE(eventName: "response.completed", json: event)
         }
 
+        state.status = "incomplete"
+        state.error = NSNull()
+        state.incompleteDetails = ["reason": "stream_ended_unexpectedly"]
         let response: [String: Any] = [
             "id": state.responseID,
             "object": "response",
@@ -140,15 +171,19 @@ final class OpenAIResponsesStreamRewriter {
         return nil
     }
 
-    private func rewriteEventBlock(_ data: Data) -> Data {
-        guard let text = String(data: data, encoding: .utf8) else { return data }
+    private func rewriteEventBlock(_ data: Data) -> StreamRewriteResult {
+        guard let text = String(data: data, encoding: .utf8) else {
+            return StreamRewriteResult(output: data, reachedLogicalEnd: false)
+        }
 
         let delimiter = text.hasSuffix("\r\n\r\n") ? "\r\n\r\n" : (text.hasSuffix("\n\n") ? "\n\n" : "")
         let body = delimiter.isEmpty ? text : String(text.dropLast(delimiter.count))
         let lines = body.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n")
 
         let dataLines = lines.filter { $0.hasPrefix("data:") }
-        guard !dataLines.isEmpty else { return data }
+        guard !dataLines.isEmpty else {
+            return StreamRewriteResult(output: data, reachedLogicalEnd: false)
+        }
 
         let payload = dataLines.map { line -> String in
             let idx = line.index(line.startIndex, offsetBy: 5)
@@ -156,17 +191,33 @@ final class OpenAIResponsesStreamRewriter {
             return raw.hasPrefix(" ") ? String(raw.dropFirst()) : raw
         }.joined(separator: "\n")
 
-        guard payload != "[DONE]",
-              let payloadData = payload.data(using: .utf8),
+        if payload == "[DONE]" {
+            logicalEndSeen = true
+            var output = Data()
+            if let currentResponseID,
+               let state = stateByResponseID[currentResponseID],
+               !state.terminalSeen,
+               let synthesized = synthesizeTerminalEvent(for: state) {
+                output.append(synthesized)
+            }
+            output.append(data)
+            return StreamRewriteResult(output: output, reachedLogicalEnd: true)
+        }
+
+        guard let payloadData = payload.data(using: .utf8),
               var json = (try? JSONSerialization.jsonObject(with: payloadData)) as? [String: Any],
               let type = json["type"] as? String else {
-            return data
+            return StreamRewriteResult(output: data, reachedLogicalEnd: false)
         }
 
         applyEvent(type: type, json: json)
+        let reachedLogicalEnd = isTerminalEventType(type)
+        if reachedLogicalEnd {
+            logicalEndSeen = true
+        }
 
         if type == "response.output_item.added" || type == "response.output_item.done" {
-            if var item = json["item"] as? [String: Any] {
+            if let item = json["item"] as? [String: Any] {
                 json["item"] = ampCompatibleItem(item)
             }
         }
@@ -180,7 +231,7 @@ final class OpenAIResponsesStreamRewriter {
 
         guard let rewrittenData = try? JSONSerialization.data(withJSONObject: json),
               let rewrittenJSON = String(data: rewrittenData, encoding: .utf8) else {
-            return data
+            return StreamRewriteResult(output: data, reachedLogicalEnd: false)
         }
 
         var rebuilt: [String] = []
@@ -197,7 +248,11 @@ final class OpenAIResponsesStreamRewriter {
         }
 
         let finalText = rebuilt.joined(separator: "\n") + delimiter
-        return Data(finalText.utf8)
+        return StreamRewriteResult(output: Data(finalText.utf8), reachedLogicalEnd: reachedLogicalEnd)
+    }
+
+    private func isTerminalEventType(_ type: String) -> Bool {
+        type == "response.completed" || type == "response.incomplete" || type == "response.failed"
     }
 
     private func applyEvent(type: String, json: [String: Any]) {
@@ -223,6 +278,7 @@ final class OpenAIResponsesStreamRewriter {
             if !state.orderedItemIDs.contains(itemID) {
                 state.orderedItemIDs.append(itemID)
             }
+            state.lastSequenceNumber = max(state.lastSequenceNumber, json["sequence_number"] as? Int ?? 0)
 
         case "response.content_part.added":
             guard let itemID = json["item_id"] as? String,
@@ -230,6 +286,7 @@ final class OpenAIResponsesStreamRewriter {
                   let part = json["part"] as? [String: Any] else { return }
             let state = state(for: json, itemID: itemID)
             state.setContentPart(itemID: itemID, contentIndex: contentIndex, part: part)
+            state.lastSequenceNumber = max(state.lastSequenceNumber, json["sequence_number"] as? Int ?? 0)
 
         case "response.output_text.delta":
             guard let itemID = json["item_id"] as? String,
@@ -237,6 +294,7 @@ final class OpenAIResponsesStreamRewriter {
                   let delta = json["delta"] as? String else { return }
             let state = state(for: json, itemID: itemID)
             state.appendOutputText(itemID: itemID, contentIndex: contentIndex, delta: delta)
+            state.lastSequenceNumber = max(state.lastSequenceNumber, json["sequence_number"] as? Int ?? 0)
 
         case "response.output_text.done":
             guard let itemID = json["item_id"] as? String,
@@ -244,24 +302,28 @@ final class OpenAIResponsesStreamRewriter {
             let finalText = json["text"] as? String
             let state = state(for: json, itemID: itemID)
             state.finishOutputText(itemID: itemID, contentIndex: contentIndex, finalText: finalText)
+            state.lastSequenceNumber = max(state.lastSequenceNumber, json["sequence_number"] as? Int ?? 0)
 
         case "response.function_call_arguments.delta":
             guard let itemID = json["item_id"] as? String,
                   let delta = json["delta"] as? String else { return }
             let state = state(for: json, itemID: itemID)
             state.appendFunctionArguments(itemID: itemID, delta: delta)
+            state.lastSequenceNumber = max(state.lastSequenceNumber, json["sequence_number"] as? Int ?? 0)
 
         case "response.function_call_arguments.done":
             guard let itemID = json["item_id"] as? String else { return }
             let arguments = json["arguments"] as? String
             let state = state(for: json, itemID: itemID)
             state.finishFunctionArguments(itemID: itemID, finalArguments: arguments)
+            state.lastSequenceNumber = max(state.lastSequenceNumber, json["sequence_number"] as? Int ?? 0)
 
         case "response.output_item.done":
             guard let item = json["item"] as? [String: Any],
                   let itemID = item["id"] as? String else { return }
             let state = state(for: json, item: item)
             state.upsertItem(itemID: itemID, incoming: item, responseJSON: json["response"] as? [String: Any])
+            state.lastSequenceNumber = max(state.lastSequenceNumber, json["sequence_number"] as? Int ?? 0)
 
         case "response.completed", "response.failed", "response.incomplete":
             guard let response = json["response"] as? [String: Any],
