@@ -3,8 +3,9 @@
 AmpBridge is a focused local bridge for routing AMP traffic so that, in the verified scenarios below:
 
 - AMP auth/internal/thread endpoints stay on `https://ampcode.com`
-- AMP Anthropic provider traffic stays on `https://ampcode.com`
-- AMP OpenAI provider traffic goes to the local provider backend on `http://127.0.0.1:8318`
+- AMP provider traffic can be switched between `https://ampcode.com` and the local provider backend
+- in local mode, AMP Anthropic provider traffic goes to the local provider backend on `http://127.0.0.1:8318`
+- in local mode, AMP OpenAI provider traffic goes to the local provider backend on `http://127.0.0.1:8318`
 - OpenAI Responses SSE is rewritten only when the upstream response is actually SSE
 - streamed OpenAI Responses terminate cleanly on logical end (`[DONE]` or explicit terminal event)
 
@@ -20,9 +21,9 @@ Route behavior:
 
 1. `/auth/cli-login` and `/api/auth/cli-login` → redirect to `https://ampcode.com`
 2. `/api/internal...` → official AMP backend
-3. `/api/provider/anthropic/...` → official AMP backend
-4. `/api/provider/openai/v1/responses...` → local provider backend, path rewritten to `/v1/responses...`, SSE rewrite enabled only for `text/event-stream`
-5. `/api/provider/openai/...` → local provider backend, path rewritten by stripping `/api/provider/openai`
+3. `/api/provider/anthropic/...` → local provider backend in `local` mode, official AMP backend in `official` mode
+4. `/api/provider/openai/v1/responses...` → local provider backend in `local` mode, path rewritten to `/v1/responses...`, SSE rewrite enabled only for `text/event-stream`; official AMP backend in `official` mode
+5. `/api/provider/openai/...` → local provider backend in `local` mode, path rewritten by stripping `/api/provider/openai`; official AMP backend in `official` mode
 6. `/v1/...` and `/api/v1/...` → local provider backend unchanged
 7. other `/api/provider/...` routes → official AMP backend
 8. unknown routes → official AMP backend
@@ -48,6 +49,23 @@ AMP CLI
 ```
 
 AmpBridge does not currently implement its own browser OAuth flow. It assumes the local provider backend on `8318` is already working.
+
+## Provider routing mode
+
+AmpBridge defaults to local provider mode. It checks `~/.config/ampbridge/mode` on each request, so switching does not require restarting the bridge:
+
+```bash
+mkdir -p ~/.config/ampbridge
+printf local > ~/.config/ampbridge/mode     # route provider traffic through local backend / VibeProxy
+printf official > ~/.config/ampbridge/mode  # route provider traffic to official AMP API
+```
+
+You can override the default with environment variables:
+
+```bash
+AMPBRIDGE_PROVIDER_MODE=official swift run ampbridge
+AMPBRIDGE_MODE_FILE=/path/to/mode swift run ampbridge
+```
 
 ## Development
 

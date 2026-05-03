@@ -1,0 +1,140 @@
+#!/bin/bash
+set -euo pipefail
+
+SETTINGS_FILE="${AMP_SETTINGS_FILE:-$HOME/.config/amp/settings.json}"
+BRIDGE_MODE_FILE="${AMPBRIDGE_MODE_FILE:-$HOME/.config/ampbridge/mode}"
+BRIDGE_URL="http://localhost:8327"
+NATIVE_URL="https://ampcode.com"
+DEFAULT_DEEP_MODEL="openai:gpt-5.5"
+DEFAULT_SMART_MODEL="anthropic:claude-opus-4-7"
+
+ensure_settings_file() {
+  mkdir -p "$(dirname "$SETTINGS_FILE")"
+  if [ ! -f "$SETTINGS_FILE" ]; then
+    python3 - "$SETTINGS_FILE" "$BRIDGE_URL" "$DEFAULT_DEEP_MODEL" "$DEFAULT_SMART_MODEL" <<'PY'
+import json, sys
+path, url, deep, smart = sys.argv[1:]
+data = {
+    "amp.url": url,
+    "amp.dangerouslyAllowAll": True,
+    "amp.defaultMode": "deep",
+    "amp.internal.model": {"deep": deep, "smart": smart},
+}
+with open(path, 'w', encoding='utf-8') as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PY
+  fi
+}
+
+set_amp_url() {
+  local target_url="$1"
+  ensure_settings_file
+  python3 - "$SETTINGS_FILE" "$target_url" "$DEFAULT_DEEP_MODEL" "$DEFAULT_SMART_MODEL" <<'PY'
+import json, sys
+path, target, deep, smart = sys.argv[1:]
+with open(path, 'r', encoding='utf-8') as f:
+    data = json.load(f)
+data["amp.url"] = target
+models = data.setdefault("amp.internal.model", {})
+models.setdefault("deep", deep)
+models["smart"] = smart
+with open(path, 'w', encoding='utf-8') as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PY
+}
+
+set_bridge_provider_mode() {
+  local mode="$1"
+  mkdir -p "$(dirname "$BRIDGE_MODE_FILE")"
+  printf '%s\n' "$mode" > "$BRIDGE_MODE_FILE"
+}
+
+current_url() {
+  ensure_settings_file
+  python3 - "$SETTINGS_FILE" <<'PY'
+import json, sys
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    data = json.load(f)
+print(data.get('amp.url', ''))
+PY
+}
+
+current_bridge_provider_mode() {
+  if [ -f "$BRIDGE_MODE_FILE" ]; then
+    tr -d '[:space:]' < "$BRIDGE_MODE_FILE"
+  else
+    echo local
+  fi
+}
+
+bridge_status() {
+  if lsof -nP -iTCP:8327 -sTCP:LISTEN >/dev/null 2>&1; then
+    echo running
+  else
+    echo stopped
+  fi
+}
+
+show_status() {
+  local url mode provider_mode
+  url="$(current_url)"
+  provider_mode="$(current_bridge_provider_mode)"
+  mode="custom"
+  if [ "$url" = "$BRIDGE_URL" ]; then
+    if [ "$provider_mode" = "official" ]; then
+      mode="official-api"
+    else
+      mode="bridge"
+    fi
+  elif [ "$url" = "$NATIVE_URL" ]; then
+    mode="native"
+  fi
+
+  echo "mode=$mode"
+  echo "amp.url=$url"
+  echo "ampbridge.provider_mode=$provider_mode"
+  echo "settings_file=$SETTINGS_FILE"
+  echo "ampbridge_mode_file=$BRIDGE_MODE_FILE"
+  echo "bridge_8327=$(bridge_status)"
+}
+
+usage() {
+  cat <<'EOF'
+Usage: amp-mode <bridge|official-api|native|status>
+
+  bridge        Amp -> AmpBridge; provider traffic -> local backend / VibeProxy
+  official-api  Amp -> AmpBridge; provider traffic -> official AMP API
+  native        Amp -> official https://ampcode.com directly, bypassing AmpBridge
+  status        Show current mode and bridge health
+EOF
+}
+
+cmd="${1:-status}"
+case "$cmd" in
+  bridge|local)
+    set_amp_url "$BRIDGE_URL"
+    set_bridge_provider_mode local
+    echo "Switched to bridge/local provider mode"
+    show_status
+    ;;
+  official-api|official)
+    set_amp_url "$BRIDGE_URL"
+    set_bridge_provider_mode official
+    echo "Switched to bridge/official AMP API provider mode"
+    show_status
+    ;;
+  native)
+    set_amp_url "$NATIVE_URL"
+    echo "Switched to native official AMP endpoint"
+    show_status
+    ;;
+  status)
+    show_status
+    ;;
+  *)
+    usage >&2
+    exit 1
+    ;;
+esac

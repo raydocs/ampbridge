@@ -9,6 +9,7 @@ final class AmpBridgeServer {
 
     private enum RewriteMode: Equatable {
         case none
+        case anthropicProvider
         case openAIResponsesIfSSE
     }
 
@@ -106,21 +107,33 @@ final class AmpBridgeServer {
 
         case .anthropicProvider:
             if config.allowAnthropicProvider {
-                proxyOfficial(request: request, connection: connection)
+                if currentProviderRoutingMode() == .official {
+                    proxyOfficial(request: request, connection: connection)
+                } else {
+                    proxyAnthropicProvider(request: request, connection: connection)
+                }
             } else {
                 writer.sendError(on: connection, statusCode: 501, message: "Anthropic provider disabled")
             }
 
         case .openAIResponses:
             if config.allowOpenAIProvider {
-                proxyOpenAIResponses(request: request, connection: connection)
+                if currentProviderRoutingMode() == .official {
+                    proxyOfficial(request: request, connection: connection)
+                } else {
+                    proxyOpenAIResponses(request: request, connection: connection)
+                }
             } else {
                 writer.sendError(on: connection, statusCode: 501, message: "OpenAI provider disabled")
             }
 
         case .openAIProviderPassthrough:
             if config.allowOpenAIProvider {
-                proxyOpenAIProvider(request: request, connection: connection)
+                if currentProviderRoutingMode() == .official {
+                    proxyOfficial(request: request, connection: connection)
+                } else {
+                    proxyOpenAIProvider(request: request, connection: connection)
+                }
             } else {
                 writer.sendError(on: connection, statusCode: 501, message: "OpenAI provider disabled")
             }
@@ -134,6 +147,36 @@ final class AmpBridgeServer {
         case .unknown:
             proxyOfficial(request: request, connection: connection)
         }
+    }
+
+    private func currentProviderRoutingMode() -> ProviderRoutingMode {
+        if let fileMode = try? String(contentsOfFile: config.modeFilePath, encoding: .utf8),
+           !fileMode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return ProviderRoutingMode.parse(fileMode)
+        }
+        return config.providerRoutingMode
+    }
+
+    private func rewrittenRequestBody(for request: HTTPRequest, rewriteMode: RewriteMode) -> Data {
+        let modelOverride: String?
+        let label: String
+        switch rewriteMode {
+        case .openAIResponsesIfSSE:
+            modelOverride = config.openAIModelOverride
+            label = "OpenAI"
+        case .anthropicProvider:
+            modelOverride = config.anthropicModelOverride
+            label = "Anthropic"
+        case .none:
+            return request.body
+        }
+
+        guard let modelOverride else { return request.body }
+        let rewrittenBody = ModelRequestBodyRewriter.rewriteModel(in: request.body, to: modelOverride)
+        if rewrittenBody != request.body {
+            print("AmpBridge \(label) model override: \(modelOverride) for \(request.path)")
+        }
+        return rewrittenBody
     }
 
     private func proxyOfficial(request: HTTPRequest, connection: NWConnection) {
@@ -166,6 +209,16 @@ final class AmpBridgeServer {
         )
     }
 
+    private func proxyAnthropicProvider(request: HTTPRequest, connection: NWConnection) {
+        proxy(
+            request: request,
+            baseURL: "http://\(config.localProviderHost):\(config.localProviderPort)",
+            pathMode: .preserve,
+            rewriteMode: .anthropicProvider,
+            connection: connection
+        )
+    }
+
     private func proxyOpenAIResponses(request: HTTPRequest, connection: NWConnection) {
         proxy(
             request: request,
@@ -190,15 +243,7 @@ final class AmpBridgeServer {
         }
         var upstream = URLRequest(url: url)
         upstream.httpMethod = request.method
-        if rewriteMode == .openAIResponsesIfSSE, let modelOverride = config.openAIModelOverride {
-            let rewrittenBody = OpenAIRequestBodyRewriter.rewriteModel(in: request.body, to: modelOverride)
-            if rewrittenBody != request.body {
-                print("AmpBridge OpenAI model override: \(modelOverride) for \(request.path)")
-            }
-            upstream.httpBody = rewrittenBody
-        } else {
-            upstream.httpBody = request.body
-        }
+        upstream.httpBody = rewrittenRequestBody(for: request, rewriteMode: rewriteMode)
 
         let excludedHeaders: Set<String> = ["host", "content-length", "connection", "transfer-encoding"]
         for (name, value) in request.headers where !excludedHeaders.contains(name.lowercased()) {

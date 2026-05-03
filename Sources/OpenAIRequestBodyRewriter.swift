@@ -1,6 +1,6 @@
 import Foundation
 
-enum OpenAIRequestBodyRewriter {
+enum ModelRequestBodyRewriter {
     static func rewriteModel(in body: Data, to model: String) -> Data {
         guard !body.isEmpty else { return body }
         guard let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
@@ -18,3 +18,5 @@ enum OpenAIRequestBodyRewriter {
         return data
     }
 }
+
+typealias OpenAIRequestBodyRewriter = ModelRequestBodyRewriter
