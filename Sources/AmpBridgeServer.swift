@@ -190,7 +190,15 @@ final class AmpBridgeServer {
         }
         var upstream = URLRequest(url: url)
         upstream.httpMethod = request.method
-        upstream.httpBody = request.body
+        if rewriteMode == .openAIResponsesIfSSE, let modelOverride = config.openAIModelOverride {
+            let rewrittenBody = OpenAIRequestBodyRewriter.rewriteModel(in: request.body, to: modelOverride)
+            if rewrittenBody != request.body {
+                print("AmpBridge OpenAI model override: \(modelOverride) for \(request.path)")
+            }
+            upstream.httpBody = rewrittenBody
+        } else {
+            upstream.httpBody = request.body
+        }
 
         let excludedHeaders: Set<String> = ["host", "content-length", "connection", "transfer-encoding"]
         for (name, value) in request.headers where !excludedHeaders.contains(name.lowercased()) {

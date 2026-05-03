@@ -7,6 +7,7 @@ struct AmpBridgeConfig {
     var ampBaseURL: String = "https://ampcode.com"
     var upstreamRequestTimeout: TimeInterval = 600
     var upstreamResourceTimeout: TimeInterval = 3600
+    var openAIModelOverride: String? = ProcessInfo.processInfo.environment["AMPBRIDGE_OPENAI_MODEL"]
 
     var allowAnthropicProvider: Bool = true
     var allowOpenAIProvider: Bool = true
