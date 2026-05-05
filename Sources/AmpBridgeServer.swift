@@ -1,6 +1,220 @@
 import Foundation
 import Network
 
+private enum UpstreamProxyError: Error, Equatable {
+    case invalidResponse
+}
+
+private struct UpstreamChunkStream {
+    let response: Task<HTTPURLResponse, Error>
+    let chunks: UpstreamChunkSequence
+    let task: URLSessionDataTask
+    // Retains the delegated URLSession for the lifetime of this stream.
+    let session: URLSession
+    let delegate: UpstreamChunkStreamDelegate
+}
+
+private struct UpstreamChunkSequence: AsyncSequence {
+    typealias Element = Data
+
+    let delegate: UpstreamChunkStreamDelegate
+
+    func makeAsyncIterator() -> Iterator {
+        Iterator(delegate: delegate)
+    }
+
+    struct Iterator: AsyncIteratorProtocol {
+        let delegate: UpstreamChunkStreamDelegate
+
+        mutating func next() async throws -> Data? {
+            try await delegate.nextChunk()
+        }
+    }
+}
+
+private final class UpstreamChunkStreamDelegate: NSObject, URLSessionDataDelegate {
+    private let lock = NSLock()
+    private let highWaterBytes = 1_048_576
+    private let lowWaterBytes = 262_144
+    private var responseContinuation: CheckedContinuation<HTTPURLResponse, Error>?
+    private var waitingChunkContinuation: CheckedContinuation<Data?, Error>?
+    private var task: URLSessionDataTask?
+    private var didResumeResponse = false
+    private var isTaskSuspended = false
+    private var isFinished = false
+    private var completionError: Error?
+    private var pendingChunks: [Data] = []
+    private var pendingByteCount = 0
+
+    func setTask(_ task: URLSessionDataTask) {
+        lock.lock()
+        self.task = task
+        lock.unlock()
+    }
+
+    func setResponseContinuation(_ continuation: CheckedContinuation<HTTPURLResponse, Error>) {
+        lock.lock()
+        responseContinuation = continuation
+        lock.unlock()
+    }
+
+    func nextChunk() async throws -> Data? {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data?, Error>) in
+            lock.lock()
+            if !pendingChunks.isEmpty {
+                let chunk = pendingChunks.removeFirst()
+                pendingByteCount -= chunk.count
+                let taskToResume = taskToResumeIfNeededLocked()
+                lock.unlock()
+                taskToResume?.resume()
+                continuation.resume(returning: chunk)
+            } else if isFinished {
+                let error = completionError
+                lock.unlock()
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: nil)
+                }
+            } else {
+                waitingChunkContinuation = continuation
+                lock.unlock()
+            }
+        }
+    }
+
+    func streamTerminated() {
+        lock.lock()
+        isFinished = true
+        completionError = URLError(.cancelled)
+        let taskToCancel = task
+        let taskToResume = isTaskSuspended ? task : nil
+        task = nil
+        isTaskSuspended = false
+        let waiter = waitingChunkContinuation
+        waitingChunkContinuation = nil
+        pendingChunks.removeAll(keepingCapacity: true)
+        pendingByteCount = 0
+        lock.unlock()
+        taskToResume?.resume()
+        taskToCancel?.cancel()
+        waiter?.resume(throwing: URLError(.cancelled))
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        guard let http = response as? HTTPURLResponse else {
+            resumeResponseIfNeeded(throwing: UpstreamProxyError.invalidResponse)
+            finishChunks(throwing: UpstreamProxyError.invalidResponse)
+            completionHandler(.cancel)
+            return
+        }
+
+        resumeResponseIfNeeded(returning: http)
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard !data.isEmpty else { return }
+
+        lock.lock()
+        guard !isFinished else {
+            lock.unlock()
+            return
+        }
+
+        if let waiter = waitingChunkContinuation {
+            waitingChunkContinuation = nil
+            lock.unlock()
+            waiter.resume(returning: data)
+            return
+        }
+
+        pendingChunks.append(data)
+        pendingByteCount += data.count
+        let taskToSuspend = taskToSuspendIfNeededLocked()
+        lock.unlock()
+        taskToSuspend?.suspend()
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error {
+            resumeResponseIfNeeded(throwing: error)
+            finishChunks(throwing: error)
+        } else {
+            resumeResponseIfNeeded(throwing: UpstreamProxyError.invalidResponse)
+            finishChunks(throwing: nil)
+        }
+        session.finishTasksAndInvalidate()
+    }
+
+    private func resumeResponseIfNeeded(returning response: HTTPURLResponse) {
+        lock.lock()
+        guard !didResumeResponse else {
+            lock.unlock()
+            return
+        }
+        didResumeResponse = true
+        let continuation = responseContinuation
+        responseContinuation = nil
+        lock.unlock()
+        continuation?.resume(returning: response)
+    }
+
+    private func resumeResponseIfNeeded(throwing error: Error) {
+        lock.lock()
+        guard !didResumeResponse else {
+            lock.unlock()
+            return
+        }
+        didResumeResponse = true
+        let continuation = responseContinuation
+        responseContinuation = nil
+        lock.unlock()
+        continuation?.resume(throwing: error)
+    }
+
+    private func finishChunks(throwing error: Error?) {
+        lock.lock()
+        guard !isFinished else {
+            lock.unlock()
+            return
+        }
+        isFinished = true
+        completionError = error
+        let waiter = waitingChunkContinuation
+        let shouldResumeWaiter = waiter != nil && pendingChunks.isEmpty
+        waitingChunkContinuation = nil
+        let taskToResume = taskToResumeIfNeededLocked()
+        lock.unlock()
+
+        if shouldResumeWaiter, let waiter {
+            if let error {
+                waiter.resume(throwing: error)
+            } else {
+                waiter.resume(returning: nil)
+            }
+        }
+        taskToResume?.resume()
+    }
+
+    private func taskToSuspendIfNeededLocked() -> URLSessionDataTask? {
+        guard pendingByteCount >= highWaterBytes, !isTaskSuspended else { return nil }
+        isTaskSuspended = true
+        return task
+    }
+
+    private func taskToResumeIfNeededLocked() -> URLSessionDataTask? {
+        guard pendingByteCount <= lowWaterBytes, isTaskSuspended else { return nil }
+        isTaskSuspended = false
+        return task
+    }
+}
+
 final class AmpBridgeServer {
     private enum UpstreamPathMode {
         case preserve
@@ -16,17 +230,9 @@ final class AmpBridgeServer {
     let config: AmpBridgeConfig
     private let writer = HTTPResponseWriter()
     private var listener: NWListener?
-    private let session: URLSession
 
     init(config: AmpBridgeConfig = AmpBridgeConfig()) {
         self.config = config
-        let sessionConfiguration = URLSessionConfiguration.ephemeral
-        sessionConfiguration.timeoutIntervalForRequest = config.upstreamRequestTimeout
-        sessionConfiguration.timeoutIntervalForResource = config.upstreamResourceTimeout
-        sessionConfiguration.requestCachePolicy = .reloadIgnoringLocalCacheData
-        sessionConfiguration.urlCache = nil
-        sessionConfiguration.httpShouldSetCookies = false
-        self.session = URLSession(configuration: sessionConfiguration)
     }
 
     func start() {
@@ -260,11 +466,15 @@ final class AmpBridgeServer {
             var didSendResponseHead = false
 
             do {
-                let (bytes, response) = try await self.session.bytes(for: upstream)
-                guard let http = response as? HTTPURLResponse else {
-                    self.writer.sendError(on: connection, statusCode: 502, message: "Invalid upstream response")
-                    return
+                let stream = self.streamChunks(for: upstream)
+                var shouldTerminateStream = true
+                defer {
+                    if shouldTerminateStream {
+                        stream.delegate.streamTerminated()
+                        stream.session.finishTasksAndInvalidate()
+                    }
                 }
+                let http = try await stream.response.value
 
                 let upstreamContentType = http.value(forHTTPHeaderField: "Content-Type")?
                     .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -277,15 +487,13 @@ final class AmpBridgeServer {
                 try await self.sendData(headersData, on: connection)
                 didSendResponseHead = true
 
-                var iterator = bytes.makeAsyncIterator()
-
                 if activeRewrite {
                     let rewriter = OpenAIResponsesStreamRewriter()
                     var buffer = Data()
                     var shouldCloseDownstream = false
 
-                    while let byte = try await iterator.next() {
-                        buffer.append(byte)
+                    for try await chunk in stream.chunks {
+                        buffer.append(chunk)
                         if self.shouldFlushSSEBuffer(buffer) {
                             let result = rewriter.process(buffer, isTransportComplete: false)
                             if !result.output.isEmpty {
@@ -307,26 +515,19 @@ final class AmpBridgeServer {
                         }
                     }
                 } else {
-                    var buffer = Data()
-
-                    while let byte = try await iterator.next() {
-                        buffer.append(byte)
-                        if buffer.count >= 4096 {
-                            try await self.sendData(buffer, on: connection)
-                            buffer.removeAll(keepingCapacity: true)
-                        }
-                    }
-
-                    if !buffer.isEmpty {
-                        try await self.sendData(buffer, on: connection)
+                    for try await chunk in stream.chunks {
+                        try await self.sendData(chunk, on: connection)
                     }
                 }
 
+                shouldTerminateStream = false
                 self.finishConnection(connection)
             } catch {
                 print("AmpBridge upstream proxy failed: \(error)")
                 if didSendResponseHead {
                     self.finishConnection(connection)
+                } else if (error as? UpstreamProxyError) == .invalidResponse {
+                    self.writer.sendError(on: connection, statusCode: 502, message: "Invalid upstream response")
                 } else {
                     self.writer.sendError(on: connection, statusCode: 502, message: "Bad Gateway")
                 }
@@ -380,6 +581,37 @@ final class AmpBridgeServer {
         }
         text += "Connection: close\r\n\r\n"
         return Data(text.utf8)
+    }
+
+    private func streamChunks(for request: URLRequest) -> UpstreamChunkStream {
+        let delegate = UpstreamChunkStreamDelegate()
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.timeoutIntervalForRequest = config.upstreamRequestTimeout
+        sessionConfiguration.timeoutIntervalForResource = config.upstreamResourceTimeout
+        sessionConfiguration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        sessionConfiguration.urlCache = nil
+        sessionConfiguration.httpShouldSetCookies = false
+
+        let delegateQueue = OperationQueue()
+        delegateQueue.maxConcurrentOperationCount = 1
+        let session = URLSession(configuration: sessionConfiguration, delegate: delegate, delegateQueue: delegateQueue)
+        let task = session.dataTask(with: request)
+        delegate.setTask(task)
+        let chunks = UpstreamChunkSequence(delegate: delegate)
+        let response = Task<HTTPURLResponse, Error> {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<HTTPURLResponse, Error>) in
+                delegate.setResponseContinuation(continuation)
+                task.resume()
+            }
+        }
+
+        return UpstreamChunkStream(
+            response: response,
+            chunks: chunks,
+            task: task,
+            session: session,
+            delegate: delegate
+        )
     }
 
     private func shouldFlushSSEBuffer(_ buffer: Data) -> Bool {

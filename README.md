@@ -37,6 +37,21 @@ Route behavior:
 - `[DONE]` now causes logical stream completion immediately; AmpBridge synthesizes a terminal event first when needed.
 - non-streaming `/responses` JSON errors are preserved as JSON and are not mislabeled as SSE.
 
+## Performance notes
+
+On May 4, 2026 (America/Denver) / May 5, 2026 UTC, the bridge/local OpenAI Responses path was optimized to stream upstream response bodies as `URLSessionDataDelegate` chunks instead of iterating `URLSession.AsyncBytes` one byte at a time. The chunk adapter uses bounded buffering/backpressure so slow downstream clients do not create unbounded queued response data.
+
+Measured with the same bridge/local prompt (`amp --mode deep --effort medium --execute`, model `gpt-5.5`, Chinese ~300-character output request):
+
+| Metric | Baseline median | Final median | Change |
+|---|---:|---:|---:|
+| Time to first token | 2700 ms | 1902 ms | -29.6% |
+| Time to first byte | 1603 ms | 1165 ms | -27.3% |
+| AMP command wall time | 8.279 s | 7.505 s | -9.3% |
+| Stream total elapsed | 4702 ms | 4810 ms | roughly flat |
+
+`eventCount` is not treated as token count. Stream-total elapsed can remain flat because it includes upstream/provider/model generation time and output-length variation, not just AmpBridge forwarding overhead. The detailed run log is kept in `prompt-exports/optimize-ampbridge-local-latency-runs.md`.
+
 ## How AmpBridge uses your existing local provider backend
 
 Current chain:
