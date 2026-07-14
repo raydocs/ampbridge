@@ -1,266 +1,119 @@
+<p align="center">
+  <img src="./assets/readme/hero.svg" width="100%" alt="AmpBridge routes AMP auth and internal traffic to ampcode.com while switching provider traffic between official and local backends">
+</p>
+
 # AmpBridge
 
-AmpBridge is a focused local bridge for routing AMP traffic so that, in the verified scenarios below:
+AmpBridge is a small Swift TCP/HTTP bridge for running AMP against an existing local provider backend without redirecting AMP authentication, internal APIs, or unrelated provider routes away from `ampcode.com`.
 
-- AMP auth/internal/thread endpoints stay on `https://ampcode.com`
-- AMP provider traffic can be switched between `https://ampcode.com` and the local provider backend
-- in local mode, AMP Anthropic provider traffic goes to the local provider backend on `http://127.0.0.1:8318`
-- in local mode, AMP OpenAI provider traffic goes to the local provider backend on `http://127.0.0.1:8318`
-- OpenAI Responses SSE is rewritten only when the upstream response is actually SSE
-- streamed OpenAI Responses terminate cleanly on logical end (`[DONE]` or explicit terminal event)
+## Proven routing boundary
 
-## Current verified routing
+The classifier and tests in this repository define the boundary:
 
-Default ports:
+| Request | Local mode | Official mode |
+|---|---|---|
+| `/auth/cli-login`, `/api/auth/cli-login` | `ampcode.com` | `ampcode.com` |
+| `/api/internal…` | `ampcode.com` | `ampcode.com` |
+| `/api/provider/anthropic/…` | local backend | `ampcode.com` |
+| `/api/provider/openai/v1/responses…` | local backend as `/v1/responses…` | `ampcode.com` |
+| other `/api/provider/openai/…` | local backend with prefix stripped | `ampcode.com` |
+| `/v1/…`, `/api/v1/…` | local backend | local backend |
+| other provider and unknown routes | `ampcode.com` | `ampcode.com` |
 
-- `8327` — AmpBridge
-- `8318` — existing local provider backend
-- `8317` — VibeProxy, if you still have it running
+For OpenAI Responses, rewriting is enabled only when the upstream actually returns `text/event-stream`. Logical end markers are handled so downstream AMP clients can finish even if the upstream connection remains open. Raw-byte request parsing supports `Content-Length` and chunked bodies and rejects conflicting framing.
 
-Route behavior:
+## Requirements
 
-1. `/auth/cli-login` and `/api/auth/cli-login` → redirect to `https://ampcode.com`
-2. `/api/internal...` → official AMP backend
-3. `/api/provider/anthropic/...` → local provider backend in `local` mode, official AMP backend in `official` mode
-4. `/api/provider/openai/v1/responses...` → local provider backend in `local` mode, path rewritten to `/v1/responses...`, SSE rewrite enabled only for `text/event-stream`; official AMP backend in `official` mode
-5. `/api/provider/openai/...` → local provider backend in `local` mode, path rewritten by stripping `/api/provider/openai`; official AMP backend in `official` mode
-6. `/v1/...` and `/api/v1/...` → local provider backend unchanged
-7. other `/api/provider/...` routes → official AMP backend
-8. unknown routes → official AMP backend
+- macOS 13 or newer (declared by `Package.swift`)
+- Swift 5.9 toolchain
+- AMP CLI already authenticated
+- an existing local provider backend listening on `127.0.0.1:8318`
 
-## Current protocol/runtime behavior
+AmpBridge does **not** implement provider login or browser OAuth. It only routes to a backend that is already working.
 
-- Request parsing is raw-byte based instead of UTF-8-whole-request based.
-- `Content-Length` and `Transfer-Encoding: chunked` request bodies are supported.
-- conflicting request framing (`Transfer-Encoding` plus `Content-Length`, or mismatched repeated `Content-Length`) is rejected as bad request.
-- OpenAI Responses SSE is rewritten for AMP compatibility.
-- `[DONE]` now causes logical stream completion immediately; AmpBridge synthesizes a terminal event first when needed.
-- non-streaming `/responses` JSON errors are preserved as JSON and are not mislabeled as SSE.
-
-## Performance notes
-
-On May 4, 2026 (America/Denver) / May 5, 2026 UTC, the bridge/local OpenAI Responses path was optimized to stream upstream response bodies as `URLSessionDataDelegate` chunks instead of iterating `URLSession.AsyncBytes` one byte at a time. The chunk adapter uses bounded buffering/backpressure so slow downstream clients do not create unbounded queued response data.
-
-Measured with the same bridge/local prompt (`amp --mode deep --effort medium --execute`, model `gpt-5.5`, Chinese ~300-character output request):
-
-| Metric | Baseline median | Final median | Change |
-|---|---:|---:|---:|
-| Time to first token | 2700 ms | 1902 ms | -29.6% |
-| Time to first byte | 1603 ms | 1165 ms | -27.3% |
-| AMP command wall time | 8.279 s | 7.505 s | -9.3% |
-| Stream total elapsed | 4702 ms | 4810 ms | roughly flat |
-
-`eventCount` is not treated as token count. Stream-total elapsed can remain flat because it includes upstream/provider/model generation time and output-length variation, not just AmpBridge forwarding overhead. The detailed run log is kept in `prompt-exports/optimize-ampbridge-local-latency-runs.md`.
-
-## How AmpBridge uses your existing local provider backend
-
-Current chain:
-
-```text
-AMP CLI
-  -> http://localhost:8327   (AmpBridge)
-  -> http://127.0.0.1:8318   (existing local provider backend)
-  -> your existing local tokens/subscription-backed auth
-```
-
-AmpBridge does not currently implement its own browser OAuth flow. It assumes the local provider backend on `8318` is already working.
-
-## Provider routing mode
-
-AmpBridge defaults to local provider mode. It checks `~/.config/ampbridge/mode` on each request, so switching does not require restarting the bridge:
+## Build and run
 
 ```bash
-mkdir -p ~/.config/ampbridge
-printf local > ~/.config/ampbridge/mode     # route provider traffic through local backend / VibeProxy
-printf official > ~/.config/ampbridge/mode  # route provider traffic to official AMP API
-```
-
-You can override the default with environment variables:
-
-```bash
-AMPBRIDGE_PROVIDER_MODE=official swift run ampbridge
-AMPBRIDGE_MODE_FILE=/path/to/mode swift run ampbridge
-```
-
-## Development
-
-```bash
-cd ~/ampbridge
 swift build
+swift test
 swift run ampbridge
 ```
 
-Run AMP against the bridge explicitly:
+The bridge listens on `127.0.0.1:8327` and keeps running in the foreground. In another terminal:
 
 ```bash
 AMP_URL=http://localhost:8327 amp --mode deep
 ```
 
-One-shot execute example:
+The effective chain in default local mode is:
+
+```text
+AMP CLI → localhost:8327 (AmpBridge) → 127.0.0.1:8318 (your provider backend)
+```
+
+## Switch provider routing without restarting
+
+AmpBridge reads `~/.config/ampbridge/mode` for every request:
 
 ```bash
-AMP_URL=http://localhost:8327 amp --mode deep --dangerously-allow-all -x "Reply with exactly: TEST"
+mkdir -p ~/.config/ampbridge
+printf 'local\n'    > ~/.config/ampbridge/mode
+printf 'official\n' > ~/.config/ampbridge/mode
 ```
 
-## Verification evidence
-
-Verification date: April 14, 2026 (America/Denver) / April 15, 2026 UTC during command runs below.
-
-### 1. Bridge builds cleanly
+Or set the initial mode and paths through environment variables:
 
 ```bash
-swift build
+AMPBRIDGE_PROVIDER_MODE=official swift run ampbridge
+AMPBRIDGE_MODE_FILE=/tmp/ampbridge-mode swift run ampbridge
+AMPBRIDGE_OPENAI_MODEL='your-model' swift run ampbridge
+AMPBRIDGE_ANTHROPIC_MODEL='your-model' swift run ampbridge
 ```
 
-Observed:
-
-```text
-Build complete! (1.17s)
-```
-
-### 2. Intended GPT/OpenAI path works through the bridge
-
-Create a deep-mode thread through the bridge:
+`Scripts/amp-mode` can also switch AMP's settings between bridge/local, bridge/official, and native official modes:
 
 ```bash
-AMP_URL=http://localhost:8327 amp --no-color -m deep threads new
+bash Scripts/amp-mode bridge
+bash Scripts/amp-mode official-api
+bash Scripts/amp-mode native
+bash Scripts/amp-mode status
 ```
 
-Observed:
+> `amp-mode` edits the AMP settings file at `~/.config/amp/settings.json` (or `AMP_SETTINGS_FILE`) and sets `amp.dangerouslyAllowAll` when it creates a new file. Review the script and resulting settings before using it.
+
+## Streaming and performance evidence
+
+The repository's recorded May 2026 local benchmark compares the same bridge/local OpenAI Responses prompt before and after replacing byte-at-a-time `AsyncBytes` iteration with delegated URLSession chunks and bounded buffering:
+
+| Metric | Recorded baseline median | Recorded final median |
+|---|---:|---:|
+| Time to first token | 2700 ms | 1902 ms |
+| Time to first byte | 1603 ms | 1165 ms |
+| AMP command wall time | 8.279 s | 7.505 s |
+| Stream total elapsed | 4702 ms | 4810 ms |
+
+These are historical measurements from one model/prompt/environment, not a general performance guarantee. The run notes are preserved in [`prompt-exports/optimize-ampbridge-local-latency-runs.md`](prompt-exports/optimize-ampbridge-local-latency-runs.md).
+
+## What is and is not verified
+
+Repository tests cover route classification, provider mode parsing, OpenAI request rewriting, and Responses stream rewriting. Historical end-to-end notes also record same-thread continuation and clean stream completion through the bridge.
+
+Built-in AMP web search in non-interactive execute mode was blocked by AMP Free / paid-credit restrictions both through the bridge and against official AMP. That tool flow is therefore **not** proven end-to-end by this repository.
+
+## Source map
 
 ```text
-T-019d8ea1-0195-734b-a72b-03ebf504c654
+Sources/AmpBridgeServer.swift                 listener, upstream proxy, buffering
+Sources/HTTPRequest.swift                    request framing and parsing
+Sources/HTTPResponseWriter.swift              downstream response writing
+Sources/RouteClassifier.swift                 routing boundary
+Sources/ProviderRoutingMode.swift             local / official mode
+Sources/OpenAIRequestBodyRewriter.swift       request compatibility rewrite
+Sources/OpenAIResponsesStreamRewriter.swift   SSE compatibility and logical end
+Scripts/amp-mode                              optional AMP settings switcher
+Tests/AmpBridgeTests/                         focused routing and rewrite tests
 ```
 
-Run a one-shot reply in that thread:
+## License
 
-```bash
-AMP_URL=http://localhost:8327 amp --no-color --no-ide --no-jetbrains --dangerously-allow-all -m deep threads continue T-019d8ea1-0195-734b-a72b-03ebf504c654 -x 'Reply with exactly: BRIDGE_ITEM3_ALPHA'
-```
-
-Observed output:
-
-```text
-BRIDGE_ITEM3_ALPHA
-```
-
-Observed AmpBridge logs:
-
-```text
-AmpBridge request: POST /api/provider/anthropic/v1/messages -> anthropicProvider
-AmpBridge request: POST /api/provider/openai/v1/responses -> openAIResponses
-AmpBridge SSE logical end reached for /api/provider/openai/v1/responses
-```
-
-### 3. Thread continuation still works
-
-Continue the same thread with a follow-up that depends on prior context:
-
-```bash
-AMP_URL=http://localhost:8327 amp --no-color --no-ide --no-jetbrains --dangerously-allow-all -m deep threads continue T-019d8ea1-0195-734b-a72b-03ebf504c654 -x 'What exact token did you reply with previously? Reply with exactly that token and nothing else.'
-```
-
-Observed output:
-
-```text
-BRIDGE_ITEM3_ALPHA
-```
-
-Exported thread markdown:
-
-```markdown
-# BRIDGE_ITEM3_ALPHA
-
-## User
-Reply with exactly: BRIDGE_ITEM3_ALPHA
-
-## Assistant
-BRIDGE_ITEM3_ALPHA
-
-## User
-What exact token did you reply with previously? Reply with exactly that token and nothing else.
-
-## Assistant
-BRIDGE_ITEM3_ALPHA
-```
-
-### 4. Stream end no longer stalls silently
-
-For real AMP deep-mode replies, AmpBridge logged logical end and the CLI returned normally.
-
-Observed log excerpt:
-
-```text
-AmpBridge request: POST /api/provider/openai/v1/responses -> openAIResponses
-AmpBridge SSE logical end reached for /api/provider/openai/v1/responses
-```
-
-A dedicated local mock probe also proved that the downstream client finished immediately after `[DONE]` even when the upstream socket stayed open for 8 more seconds; see commit history / local verification notes for the exact probe commands used during development.
-
-### 5. Execute-mode web search / tool loop blocker
-
-A real deep-mode search-oriented prompt through the bridge:
-
-```bash
-/usr/bin/time -p env AMP_URL=http://localhost:8327 amp --no-color --no-ide --no-jetbrains --dangerously-allow-all -m deep threads continue T-019d8ea2-6f90-74ed-87d7-d2241cda32c0 -x 'Use web search to answer this. What is the current price of Bitcoin in USD right now? Start with USED_WEB_SEARCH, include one source URL, and keep the answer under 3 sentences.'
-```
-
-Observed final output:
-
-```text
-USED_WEB_SEARCH Bitcoin is about `$74,500.40` USD right now, based on Coinbase’s live spot price feed. Source: https://api.coinbase.com/v2/prices/spot?currency=USD
-real 19.80
-```
-
-Observed bridge logs during that run:
-
-```text
-AmpBridge request: POST /api/internal?webSearch2 -> internalAPI
-AmpBridge request: POST /api/provider/openai/v1/responses -> openAIResponses
-AmpBridge SSE logical end reached for /api/provider/openai/v1/responses
-AmpBridge request: POST /api/provider/openai/v1/responses -> openAIResponses
-AmpBridge SSE logical end reached for /api/provider/openai/v1/responses
-```
-
-However, exported thread markdown shows the built-in AMP `web_search` tool failed in execute mode and the agent fell back to `shell_command`:
-
-```markdown
-## Assistant
-**Tool Use:** `web_search`
-
-## User
-**Tool Error:** ... Failed to perform web search: Amp Free is not available in execute mode or the Amp SDK.
-
-## Assistant
-The dedicated web search tool is unavailable in this environment, so I’m falling back to a live public market-data endpoint...
-```
-
-To confirm that this is not caused by AmpBridge, the same prompt was run directly against official AMP without the bridge:
-
-```bash
-/usr/bin/time -p amp --no-color --no-ide --no-jetbrains --dangerously-allow-all -m deep threads continue T-019d8ea4-bbc3-750b-9668-e3c652170643 -x 'Use web search to answer this. What is the current price of Bitcoin in USD right now? Start with USED_WEB_SEARCH, include one source URL, and keep the answer under 3 sentences.'
-```
-
-Observed official-AMP output:
-
-```text
-Error: 402 Execute mode (amp -x) and the Amp SDK require paid credits and cannot use Amp Free in non-interactive contexts. Add credits at https://ampcode.com/pay to continue.
-real 2.25
-```
-
-Current conclusion:
-
-- GPT/OpenAI deep-mode bridge path is working for the verified execute-mode scenarios above.
-- same-thread continuation is working for the verified thread above.
-- stream-end handling is working.
-- execute-mode verification of built-in web search / tool flows remains blocked by AMP Free / paid-credit restrictions on the AMP side, so full built-in-search success is still not proven end-to-end through AmpBridge.
-
-## Source files
-
-- `Sources/AmpBridgeConfig.swift`
-- `Sources/AmpBridgeServer.swift`
-- `Sources/HTTPRequest.swift`
-- `Sources/HTTPResponseWriter.swift`
-- `Sources/OpenAIResponsesStreamRewriter.swift`
-- `Sources/RouteClassifier.swift`
-- `Sources/main.swift`
+No license file or package license declaration is present. Treat the source as all rights reserved unless the maintainer publishes licensing terms.
